@@ -41,7 +41,7 @@ def main(args):
     # 原本的 source code 是直接在cpu上跑，下面是把它改成它會先去看有沒有gpu可以使用
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    dt = torch.load(args.model_path, map_location=device)
+    dt = torch.load(args.model_path, map_location=device, weights_only=False)
     net.load_state_dict(dt)
     net = net.to(device)
 

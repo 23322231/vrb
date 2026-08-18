@@ -1,0 +1,20 @@
+{
+  "name": "VRB GPU Development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "runArgs": [
+    "--gpus",
+    "all",
+    "--ipc=host",
+    "--shm-size=16g"
+  ],
+  "workspaceFolder": "/workspaces/vrb",
+  "remoteUser": "root",
+  "mounts": [
+    "type=bind,source=${localWorkspaceFolder}/../GroundingDINO,target=/workspaces/GroundingDINO",
+    "type=bind,source=${localWorkspaceFolder}/../LangSAM,target=/workspaces/LangSAM"
+  ],
+  "postCreateCommand": "git config --global --add safe.directory /workspaces/GroundingDINO && git config --global --add safe.directory /workspaces/LangSAM"
+}
