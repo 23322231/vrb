@@ -5,3 +5,6 @@ models/
 *.pyc
 __pycache__/
 *.pth
+
+# 用來寫commit的檔案
+commit.txt
