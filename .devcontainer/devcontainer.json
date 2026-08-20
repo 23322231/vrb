@@ -1,20 +1,73 @@
 {
-  "name": "VRB GPU Development",
+  "name": "VRB + Robot Arm Development",
+
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-  "runArgs": [
-    "--gpus",
-    "all",
-    "--ipc=host",
-    "--shm-size=16g"
-  ],
+
+  "remoteUser": "c23322231",
+
   "workspaceFolder": "/workspaces/vrb",
-  "remoteUser": "root",
+
+  "runArgs": [
+    "--network=host",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt=seccomp:unconfined",
+    "--security-opt=apparmor:unconfined",
+    "--env=DISPLAY=${localEnv:DISPLAY}",
+    "--env=QT_X11_NO_MITSHM=1",
+    "--volume=/tmp/.X11-unix:/tmp/.X11-unix:rw",
+    "--ipc=host",
+    "--pid=host",
+    "--gpus=all",
+    "--runtime=nvidia",
+    "--shm-size=16g",
+    "--volume=/dev:/dev",
+    "--device-cgroup-rule=c 188:* rmw",
+    "--device-cgroup-rule=c 81:* rmw",
+    "--device-cgroup-rule=c 189:* rmw"
+  ],
+
   "mounts": [
     "type=bind,source=${localWorkspaceFolder}/../GroundingDINO,target=/workspaces/GroundingDINO",
     "type=bind,source=${localWorkspaceFolder}/../LangSAM,target=/workspaces/LangSAM"
   ],
-  "postCreateCommand": "git config --global --add safe.directory /workspaces/GroundingDINO && git config --global --add safe.directory /workspaces/LangSAM"
+
+  "containerEnv": {
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY}",
+    "XDG_RUNTIME_DIR": "${localEnv:XDG_RUNTIME_DIR}",
+    "LIBGL_ALWAYS_INDIRECT": "0",
+    "MESA_GL_VERSION_OVERRIDE": "3.3",
+    "LIBGL_ALWAYS_SOFTWARE": "0",
+    "QT_X11_NO_MITSHM": "1",
+    "QT_QPA_PLATFORM": "xcb",
+    "NO_AT_BRIDGE": "1"
+  },
+
+  "postCreateCommand": "sudo git config --system --add safe.directory /workspaces/GroundingDINO && sudo git config --system --add safe.directory /workspaces/LangSAM && sudo git config --system --add safe.directory /workspaces/vrb && pip install -v -e /workspaces/GroundingDINO --no-build-isolation && pip install \"huggingface-hub==0.13.4\" \"transformers==4.27.4\" && pip install -v -e /workspaces/LangSAM --no-deps --no-build-isolation",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "yzhang.markdown-all-in-one",
+        "shd101wyy.markdown-preview-enhanced",
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "MS-CEINTL.vscode-language-pack-zh-hant",
+        "twxs.cmake",
+        "ms-vscode.cmake-tools",
+        "bierner.markdown-mermaid",
+        "DavidAnson.vscode-markdownlint",
+        "ms-python.vscode-pylance",
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-iot.vscode-ros",
+        "ms-vscode.cpptools-themes",
+        "JaehyunShim.vscode-ros2",
+        "althack.ament-task-provider"
+      ]
+    }
+  }
 }
