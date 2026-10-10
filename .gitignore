@@ -8,3 +8,5 @@ __pycache__/
 
 # 用來寫commit的檔案
 COMMIT.md
+vrb_dataset
+runs
