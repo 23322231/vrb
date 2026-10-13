@@ -10,3 +10,9 @@ __pycache__/
 COMMIT.md
 vrb_dataset
 runs
+DATA
+needle5_dataset/
+pred_handoff_output/
+
+# 圖片檔
+*.png
