@@ -11,15 +11,31 @@
         不跑軌跡分支（軌跡 loss 完全不計）
         --loss sym：每筆取「正序」與「頭尾互換」兩者較小的 loss（頭尾分不出來時的備案）
 - --attn_kp_fc 1（官方預設）：全域池化 + 全連接層直接回歸座標
-  --attn_kp_fc 0           ：官方原始碼的另一條路徑，每個點一張 heatmap 再取 soft-argmax，
-                             空間定位通常較準。注意官方這條路徑輸出 (y, x)，本程式已自動轉換
+  --attn_kp_fc 0           ：官方原始碼的另一條路徑，每個點一張 heatmap 再取 soft-argmax。
+                             注意官方這條路徑輸出 (y, x)，本程式已自動轉換。
+                             官方的 get_coord 會先對整列取平均再 softmax，heatmap 又經過 ReLU，
+                             分布幾乎是均勻的 -> 5 點都會縮到裁切中心（實測現象）。
+                             --kp_beta > 0 時改用「2D softmax(beta * heatmap)」再取邊際分布，
+                             這是對官方 get_coord 的修改（架構/權重不變，只改這個無參數的函式）
 - 裁切：以針的框為中心的正方形，邊長 = 框長邊 + 2*pad（pad = max(box_pad, box_pad_ratio*長邊)），
-        再縮成 224x224。訓練時加隨機縮放 / 位移 / 翻轉
+        再縮成 224x224。訓練時加隨機縮放 / 位移 / 翻轉 / 旋轉（--rot_deg）
 - 每次訓練存到 <out_dir>_<開始時間>/，可用 --resume 接續
 - 學習曲線：每 --plot_every 個 epoch 更新 <run>/curves.png（train / val loss 與 val 各點 pixel 誤差）
   也可以隨時另外畫：python train_vrb_needle5.py --plot_only runs/needle5_fc1_20261012_181530
 
+兩種資料格式（自動辨識）:
+    A. mask_to_needle5.py 的 annotations.json      -> 線上增強（每次讀圖時隨機裁切 / 翻轉 / 旋轉 / 色彩）
+       預設 train = train+val、val = test
+    B. build_needle5_aug.py 的 annotations.json     -> 離線增強（直接讀存好的 224x224 圖，訓練時不再做任何增強）
+       ("format": "needle5_crops")                     預設 train = train、val = val，訓練完用 best 權重評估 test
+
 用法:
+    # B. 離線增強資料集（--images_root 不用給，預設就是 annotations.json 所在資料夾）
+    python train_vrb_needle5.py --vrb_root . --ann ./needle5_aug/annotations.json \
+        --pretrained ./models/model_checkpoint_1249.pth.tar --out_dir ./runs/needle5_aug \
+        --attn_kp_fc 0 --kp_beta 10 --epochs 40
+
+    # A. 線上增強
     python train_vrb_needle5.py --vrb_root . \
         --ann needle5_dataset/annotations.json \
         --images_root /path/to/DATA/Images \
@@ -97,6 +113,28 @@ class Needle5Dataset(Dataset):
             self.cache[rel] = Image.open(os.path.join(self.root, rel)).convert("RGB")
         return self.cache[rel]
 
+    @staticmethod
+    def _rotated_crop(img, pts, x0, y0, side, deg):
+        """以裁切中心旋轉 deg 度（逆時針）：先裁一個 1.5 倍大的區域旋轉，再取中間，四角不會出現黑邊。
+        旋轉後有點跑出裁切範圍就回傳 (None, None)，改用不旋轉。"""
+        cx, cy = x0 + side / 2, y0 + side / 2
+        big = int(math.ceil(side * 1.5))
+        bx0, by0 = int(round(cx - big / 2)), int(round(cy - big / 2))
+        region = img.crop((bx0, by0, bx0 + big, by0 + big)).rotate(deg, resample=Image.BILINEAR)
+        o = int(round((big - side) / 2))
+        crop = region.crop((o, o, o + side, o + side))
+        # PIL 以 region 中心 (big/2, big/2) 旋轉；在影像座標（y 向下）中是逆時針：
+        # (dx, dy) -> (dx cos + dy sin, -dx sin + dy cos)
+        th = math.radians(deg)
+        rc = np.array([bx0 + big / 2, by0 + big / 2]) - 0.5          # PIL 的旋轉中心換成像素索引座標
+        d = pts - rc
+        rd = np.stack([d[:, 0] * math.cos(th) + d[:, 1] * math.sin(th),
+                       -d[:, 0] * math.sin(th) + d[:, 1] * math.cos(th)], axis=1)
+        pn = (rd + rc - np.array([bx0 + o, by0 + o])) / side
+        if (pn < 0).any() or (pn > 1).any():
+            return None, None
+        return crop.resize((224, 224), Image.BILINEAR), pn
+
     def __getitem__(self, i):
         s = self.samples[i]
         img = self._load(s["image"])
@@ -105,8 +143,12 @@ class Needle5Dataset(Dataset):
 
         # train：全域 random（DataLoader 每個 worker / epoch 會重新 seed）；val：不加擾動
         x0, y0, side = needle_crop(s["needle_bbox"], W, H, self.args, random if self.train else None)
-        crop = img.crop((x0, y0, x0 + side, y0 + side)).resize((224, 224), Image.BILINEAR)
-        pn = (pts - np.array([x0, y0])) / side                               # crop 內 normalized (x, y)
+        crop, pn = None, None
+        if self.train and self.args.rot_deg > 0:
+            crop, pn = self._rotated_crop(img, pts, x0, y0, side, random.uniform(-self.args.rot_deg, self.args.rot_deg))
+        if crop is None:
+            crop = img.crop((x0, y0, x0 + side, y0 + side)).resize((224, 224), Image.BILINEAR)
+            pn = (pts - np.array([x0, y0])) / side                           # crop 內 normalized (x, y)
 
         # 翻轉不改變點的語意（針頭還是針頭），所以順序不變
         if self.train and random.random() < self.args.hflip:
@@ -123,6 +165,33 @@ class Needle5Dataset(Dataset):
             "pts": torch.from_numpy(pn),                                     # (5, 2) x, y
             "crop": torch.tensor([x0, y0, side], dtype=torch.float32),
             "name": f"{os.path.splitext(os.path.basename(s['image']))[0]}_n{s['needle_id']}.png",
+        }
+
+
+class Needle5CropDataset(Dataset):
+    """build_needle5_aug.py 產生的離線增強資料：224x224 圖 + 圖內 normalized 5 點，不再做任何增強。"""
+
+    def __init__(self, ann, root, splits, orig_only=False):
+        self.samples = [s for s in ann["samples"] if s["split"] in splits
+                        and not (orig_only and s.get("augmented", False))]
+        self.root = root
+        self.tf = transforms.Compose([transforms.ToTensor(),
+                                      transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        s = self.samples[i]
+        img = Image.open(os.path.join(self.root, s["image"])).convert("RGB")
+        if img.size != (224, 224):
+            img = img.resize((224, 224), Image.BILINEAR)
+        return {
+            "img": self.tf(img),
+            "img_raw": torch.from_numpy(np.asarray(img).copy()),
+            "pts": torch.tensor(s["points"], dtype=torch.float32),
+            "crop": torch.tensor([0, 0, s["side_px"]], dtype=torch.float32),   # side_px：誤差換算回原圖 pixel
+            "name": os.path.basename(s["image"]),
         }
 
 
@@ -144,6 +213,22 @@ def build_vrb(args):
                     embed_dim=args.cond_dim, coord_dim=args.coord_dim,
                     num_heads=args.num_heads, enc_depth=args.enc_depth,
                     attn_kp=args.attn_kp, attn_kp_fc=args.attn_kp_fc, n_maps=5)
+
+
+def patch_get_coord(beta):
+    """把官方 networks.model.get_coord 換成 2D softmax(beta * x) 的邊際分布版本（簽名與回傳格式相同）。"""
+    import torch.nn.functional as F
+    import networks.model as M
+
+    def get_coord(x, other_axis, axis_size):
+        B, C, Hh, Ww = x.shape
+        p2 = F.softmax(beta * x.reshape(B, C, -1), dim=-1).reshape(B, C, Hh, Ww)
+        g_c_prob = p2.sum(dim=other_axis)                                   # 邊際分布 (B, C, axis)
+        coord_pt = torch.linspace(0, 1.0, axis_size, device=x.device).view(1, 1, axis_size)
+        return torch.sum(g_c_prob * coord_pt, dim=2), g_c_prob
+
+    M.get_coord = get_coord
+    print(f"[NOTE] 已將 networks.model.get_coord 改為 2D softmax（beta={beta}）")
 
 
 def load_pretrained(net, path):
@@ -381,7 +466,12 @@ def main(args):
 
     with open(args.ann, "r", encoding="utf-8") as f:
         ann = json.load(f)
-    images_root = args.images_root or ann.get("images_root")
+    offline = ann.get("format") == "needle5_crops"
+    if args.train_splits is None:
+        args.train_splits = ["train"] if offline else ["train", "val"]
+    if args.val_splits is None:
+        args.val_splits = ["val"] if offline else ["test"]
+    images_root = args.images_root or (os.path.dirname(os.path.abspath(args.ann)) if offline else ann.get("images_root"))
     if not images_root or not os.path.isdir(images_root):
         sys.exit(f"[ERROR] 找不到影像資料夾 {images_root}，請用 --images_root 指定（container 內的路徑）")
     args.images_root = os.path.abspath(images_root)
@@ -394,10 +484,18 @@ def main(args):
     random.seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    train_set = Needle5Dataset(ann, args.images_root, args.train_splits, args, train=True)
-    val_set = Needle5Dataset(ann, args.images_root, args.val_splits, args, train=False)
-    train_eval_set = Needle5Dataset(ann, args.images_root, args.train_splits, args, train=False)
-    print(f"train {len(train_set)} 根針 ({args.train_splits}) / val {len(val_set)} 根針 ({args.val_splits})")
+    if offline:
+        train_set = Needle5CropDataset(ann, args.images_root, args.train_splits)
+        val_set = Needle5CropDataset(ann, args.images_root, args.val_splits)
+        train_eval_set = Needle5CropDataset(ann, args.images_root, args.train_splits, orig_only=True)
+        n_orig = sum(not x.get("augmented", False) for x in train_set.samples)
+        print(f"[離線增強資料] train {len(train_set)} 張（其中原圖 {n_orig}）({args.train_splits}) / "
+              f"val {len(val_set)} 張 ({args.val_splits})；訓練時不再做線上增強")
+    else:
+        train_set = Needle5Dataset(ann, args.images_root, args.train_splits, args, train=True)
+        val_set = Needle5Dataset(ann, args.images_root, args.val_splits, args, train=False)
+        train_eval_set = Needle5Dataset(ann, args.images_root, args.train_splits, args, train=False)
+        print(f"[線上增強] train {len(train_set)} 根針 ({args.train_splits}) / val {len(val_set)} 根針 ({args.val_splits})")
     if len(train_set) == 0:
         sys.exit("[ERROR] 沒有訓練資料")
     bs = min(args.batch_size, len(train_set))
@@ -406,6 +504,10 @@ def main(args):
     train_eval_loader = DataLoader(train_eval_set, batch_size=bs, shuffle=False, num_workers=0)
 
     net = build_vrb(args)
+    if not args.attn_kp_fc and args.kp_beta > 0:
+        patch_get_coord(args.kp_beta)
+    elif not args.attn_kp_fc:
+        print("[WARN] attn_kp_fc=0 但 kp_beta=0：使用官方 get_coord，5 點很可能都縮到裁切中心")
     if resume_state is None:
         load_pretrained(net, args.pretrained)
     net = net.to(device)
@@ -512,6 +614,21 @@ def main(args):
     log_f.close()
     print(f"完成，best val mean = {best:.1f}px，結果在 {run_dir}（學習曲線：curves.png）")
 
+    # 用 best 權重評估 test（只在 test 沒被拿來訓練 / 選模型時）
+    test_splits = [sp for sp in ("test",) if sp not in args.train_splits and sp not in args.val_splits]
+    best_path = os.path.join(run_dir, "model_best.pth.tar")
+    if test_splits and os.path.isfile(best_path):
+        test_set = (Needle5CropDataset(ann, args.images_root, test_splits) if offline
+                    else Needle5Dataset(ann, args.images_root, test_splits, args, train=False))
+        if len(test_set):
+            net.load_state_dict(torch.load(best_path, map_location=device, weights_only=False))
+            tm = evaluate(net, DataLoader(test_set, batch_size=bs, shuffle=False, num_workers=0), device, args,
+                          os.path.join(run_dir, "vis", "test_best"))
+            with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
+                json.dump(tm, f, indent=2)
+            print(f"[test, best 權重] {len(test_set)} 張  mean {tm['mean_px']:.1f}px  "
+                  + "  ".join(f"{k} {tm[k + '_px']:.1f}" for k in POINT_NAMES) + f"  flip {tm['flip_rate']:.0%}")
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -521,8 +638,10 @@ if __name__ == "__main__":
     p.add_argument("--pretrained")
     p.add_argument("--out_dir", default="runs/needle5", help="實際存到 <out_dir>_<開始時間>/")
     p.add_argument("--resume", default=None, help="run 資料夾 / checkpoint_last.pth / latest")
-    p.add_argument("--train_splits", nargs="+", default=["train", "val"])
-    p.add_argument("--val_splits", nargs="+", default=["test"])
+    p.add_argument("--train_splits", nargs="+", default=None,
+                   help="預設：離線資料 train；線上資料 train val")
+    p.add_argument("--val_splits", nargs="+", default=None,
+                   help="預設：離線資料 val；線上資料 test")
 
     # 架構（與官方 demo.py 相同；attn_kp_fc 可選 0 / 1）
     p.add_argument("--num_heads", type=int, default=8)
@@ -534,6 +653,8 @@ if __name__ == "__main__":
     p.add_argument("--resnet_type", type=str, default="resnet18")
     p.add_argument("--attn_kp", type=int, default=1)
     p.add_argument("--attn_kp_fc", type=int, default=1, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
+    p.add_argument("--kp_beta", type=float, default=0,
+                   help="attn_kp_fc=0 時的 softmax 溫度倒數；>0 會改用 2D softmax（建議 10~30），0 = 官方原版")
     p.add_argument("--traj_len", type=int, default=5)
     p.add_argument("--encoder_time_embed_type", default="sin", choices=["sin", "param"])
 
@@ -544,7 +665,8 @@ if __name__ == "__main__":
     p.add_argument("--scale_jitter", type=float, default=0.15)
     p.add_argument("--center_jitter", type=float, default=0.08)
     p.add_argument("--hflip", type=float, default=0.5)
-    p.add_argument("--vflip", type=float, default=0.0)
+    p.add_argument("--vflip", type=float, default=0.5)
+    p.add_argument("--rot_deg", type=float, default=180, help="訓練時隨機旋轉 ±rot_deg 度（0 = 關閉）")
     p.add_argument("--color_aug", type=int, default=1)
     p.add_argument("--hue", type=float, default=0.05)
 

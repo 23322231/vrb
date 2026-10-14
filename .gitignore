@@ -16,3 +16,9 @@ pred_handoff_output/
 
 # 圖片檔
 *.png
+
+*.txt
+
+*.pt
+
+*.cache

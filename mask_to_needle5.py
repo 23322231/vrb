@@ -282,7 +282,8 @@ HELP_LINES = [
 
 
 def render_task(rgb, nd, dec, title, view=720, pad=120, r=3):
-    """左：原圖縮小（框出這根針的位置）；右：放大裁切，畫中心線、兩端點與依目前選擇算出的 5 點。"""
+    """左：同一個裁切範圍的原圖放大，不畫任何東西（方便看清楚針頭 / 針尾）；
+    右：同樣的裁切，畫中心線、兩端點（1 / 2）與依目前選擇算出的 5 點。"""
     H, W = rgb.shape[:2]
     x1, y1, x2, y2 = nd["bbox"]
     cx0, cy0 = int(max(x1 - pad, 0)), int(max(y1 - pad, 0))
@@ -290,6 +291,7 @@ def render_task(rgb, nd, dec, title, view=720, pad=120, r=3):
     crop = rgb[cy0:cy1, cx0:cx1].copy()
     s = view / max(crop.shape[:2])
     crop = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+    clean = crop.copy()                                       # 左側用：完全不標註
     P = lambda p: tuple(np.round((np.asarray(p) - [cx0, cy0]) * s).astype(int))
 
     poly = nd["poly"]
@@ -309,12 +311,7 @@ def render_task(rgb, nd, dec, title, view=720, pad=120, r=3):
             cv2.circle(crop, P(p), r, c, -1, cv2.LINE_AA)
         draw_legend(crop)
 
-    # 左側：整張圖縮小，框出目前這根針
-    ov = rgb.copy()
-    cv2.rectangle(ov, (int(x1) - 4, int(y1) - 4), (int(x2) + 4, int(y2) + 4), (0, 255, 255), 3)
-    so = crop.shape[0] / H
-    ov = cv2.resize(ov, None, fx=so, fy=so, interpolation=cv2.INTER_AREA)
-    canvas = np.hstack([ov, np.full((crop.shape[0], 6, 3), 40, np.uint8), crop])
+    canvas = np.hstack([clean, np.full((crop.shape[0], 6, 3), 40, np.uint8), crop])
 
     status = {"A": "HEAD = 1 (green)", "B": "HEAD = 2 (magenta)", "bad": "BAD (excluded)",
               None: "not decided"}.get(dec, str(dec))
@@ -327,11 +324,20 @@ def render_task(rgb, nd, dec, title, view=720, pad=120, r=3):
     return np.vstack([canvas, bar])
 
 
-def run_ui(tasks, rgb_loader, decisions, dec_path):
-    """tasks: [(key, rel, nd)]。可前後翻頁，每次決定立即存檔。從第一個未決定的開始。"""
+def run_ui(tasks, rgb_loader, decisions, dec_path, goto=None, review=False):
+    """tasks: [(key, rel, nd)]。可前後翻頁，每次決定立即存檔（已標過的也可以重按 1 / 2 / b 覆蓋）。
+    起點：--goto 指定的圖 > --review 從第 1 根 > 第一個未決定的。"""
     win = "needle head labeling"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    i = next((k for k, t in enumerate(tasks) if decisions.get(t[0]) not in ("A", "B", "bad")), 0)
+    if goto:
+        i = next((k for k, t in enumerate(tasks) if goto in t[1]), None)
+        if i is None:
+            print(f"[WARN] 找不到檔名包含 '{goto}' 的圖，從頭開始")
+            i = 0
+    elif review:
+        i = 0
+    else:
+        i = next((k for k, t in enumerate(tasks) if decisions.get(t[0]) not in ("A", "B", "bad")), 0)
     cache = {}
     while 0 <= i < len(tasks):
         key, rel, nd = tasks[i]
@@ -398,6 +404,8 @@ def main():
     ap.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     ap.add_argument("--radius", type=int, default=2)
     ap.add_argument("--limit", type=int, default=0, help="只處理前 N 張（測試用）")
+    ap.add_argument("--goto", default=None, help="互動模式直接跳到檔名包含此字串的圖，例如 --goto test/left_34")
+    ap.add_argument("--review", action="store_true", help="互動模式從第 1 根針開始（檢查 / 修改已標過的）")
     args = ap.parse_args()
 
     colors = parse_color_txt(args.color_txt)
@@ -444,7 +452,8 @@ def main():
     # 2) 互動標頭尾
     if args.mode == "interactive":
         tasks = [(f"{rel}#{nd['id']}", rel, nd) for rel, _, _, nds in per_image for nd in nds]
-        run_ui(tasks, lambda rel: cv2.imread(os.path.join(args.images_dir, rel)), decisions, dec_path)
+        run_ui(tasks, lambda rel: cv2.imread(os.path.join(args.images_dir, rel)), decisions, dec_path,
+               goto=args.goto, review=args.review)
 
     # 3) 輸出
     samples = []
