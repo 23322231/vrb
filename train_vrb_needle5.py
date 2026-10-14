@@ -282,6 +282,24 @@ def predict_xy(net, img, args):
     return mu
 
 
+def local_decode(hm_logits, beta, radius):
+    """熱度圖解碼：先找機率最大的格子，只用它周圍 (2r+1)x(2r+1) 範圍的機率做加權平均。
+    全圖 soft-argmax 會被分散在整張圖的小機率拉向中心；只看尖峰附近可以去掉這個偏差。
+    hm_logits: (B, C, H, W) tensor -> (B, C, 2) normalized (x, y)"""
+    B, C, Hh, Ww = hm_logits.shape
+    p = torch.softmax(beta * hm_logits.float().reshape(B, C, -1), dim=-1).reshape(B, C, Hh, Ww)
+    idx = p.reshape(B, C, -1).argmax(-1)
+    iy, ix = (idx // Ww).view(B, C, 1, 1), (idx % Ww).view(B, C, 1, 1)
+    yy = torch.arange(Hh, device=p.device).view(1, 1, Hh, 1)
+    xx = torch.arange(Ww, device=p.device).view(1, 1, 1, Ww)
+    win = ((yy - iy).abs() <= radius) & ((xx - ix).abs() <= radius)
+    pl = p * win
+    pl = pl / pl.sum(dim=(2, 3), keepdim=True).clamp_min(1e-12)
+    gx = torch.linspace(0, 1, Ww, device=p.device).view(1, 1, 1, Ww)
+    gy = torch.linspace(0, 1, Hh, device=p.device).view(1, 1, Hh, 1)
+    return torch.stack([(pl * gx).sum(dim=(2, 3)), (pl * gy).sum(dim=(2, 3))], dim=-1)
+
+
 def heatmap_loss(gt, args):
     """DSNT / 高斯 heatmap 監督：每個點的目標是以 GT 為中心的 2D 高斯分布，
     與 softmax(beta * heatmap) 算 KL divergence。讓每個 channel 在「正確位置」形成單一尖峰，
@@ -325,6 +343,7 @@ def evaluate(net, loader, device, args, vis_dir=None):
     net.eval()
     sum_err = torch.zeros(5)
     sum_err_ord = torch.zeros(5)
+    sum_err_global = torch.zeros(5)
     n, loss_sum, flips = 0, 0.0, 0
     zero_sum = 0.0
     for batch in loader:
@@ -332,11 +351,20 @@ def evaluate(net, loader, device, args, vis_dir=None):
         gt = batch["pts"].to(device)
         HM_CACHE.pop("x", None)
         pred = predict_xy(net, img, args)
-        hm = HM_CACHE.get("x")
-        hm = hm.float().cpu().numpy() if hm is not None else None
+        hm_t = HM_CACHE.get("x")
+        hm = hm_t.float().cpu().numpy() if hm_t is not None else None
         if hm is not None:
             zero_sum += float((hm == 0).mean()) * img.shape[0]
         loss_sum += contact_loss(pred, gt, args.loss).item() * img.shape[0]
+        pred_global = pred
+        if hm_t is not None and args.decode == "local":
+            pred = local_decode(hm_t, args.kp_beta if args.kp_beta > 0 else 1.0, args.decode_radius)
+        # 全圖 soft-argmax 的誤差另外記錄，方便比較兩種解碼
+        e_g = (pred_global - gt).norm(dim=-1)
+        e_gs = (pred_global - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1)
+        if args.loss == "sym":
+            e_g = torch.where((e_gs.mean(1) < e_g.mean(1))[:, None], e_gs, e_g)
+        sum_err_global += (e_g * batch["crop"][:, 2].to(device)[:, None]).sum(0).cpu()
         side = batch["crop"][:, 2].to(device)[:, None]
         err = (pred - gt).norm(dim=-1) * side                                # (B, 5) 原圖 pixel
         err_sw = (pred - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1) * side
@@ -363,7 +391,8 @@ def evaluate(net, loader, device, args, vis_dir=None):
     per = (sum_err / max(n, 1)).tolist()
     per_ord = (sum_err_ord / max(n, 1)).tolist()
     m = {"loss": loss_sum / max(n, 1), "mean_px": float(np.mean(per)), "flip_rate": flips / max(n, 1),
-         "mean_px_ordered": float(np.mean(per_ord)), "hm_zero_frac": zero_sum / max(n, 1)}
+         "mean_px_ordered": float(np.mean(per_ord)), "hm_zero_frac": zero_sum / max(n, 1),
+         "mean_px_softargmax": float((sum_err_global / max(n, 1)).mean())}
     m.update({f"{k}_px": v for k, v in zip(POINT_NAMES, per)})
     return m
 
@@ -733,7 +762,8 @@ def main(args):
                 msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else ''} {vm['mean_px']:.1f}px (head {vm['head_px']:.1f} tail {vm['tail_px']:.1f} "
                         f"mid {vm['middle_px']:.1f} h1/3 {vm['head_1_3_px']:.1f} t1/3 {vm['tail_1_3_px']:.1f}) "
                         f"flip {vm['flip_rate']:.0%}"
-                        + (f" hm0 {vm['hm_zero_frac']:.0%}" if not args.attn_kp_fc else ""))
+                        + (f" hm0 {vm['hm_zero_frac']:.0%} | soft-argmax(全圖) {vm['mean_px_softargmax']:.1f}px"
+                           if not args.attn_kp_fc else ""))
                 if vm["mean_px"] < best:
                     best = vm["mean_px"]
                     torch.save(net.state_dict(), os.path.join(run_dir, "model_best.pth.tar"))
@@ -804,6 +834,9 @@ if __name__ == "__main__":
     p.add_argument("--resnet_type", type=str, default="resnet18")
     p.add_argument("--attn_kp", type=int, default=1)
     p.add_argument("--attn_kp_fc", type=int, default=1, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
+    p.add_argument("--decode", choices=["local", "global"], default="local",
+                   help="attn_kp_fc=0 時評估 / 畫圖用的解碼：local = 只看尖峰附近（去掉往中心拉的偏差）；global = 全圖 soft-argmax")
+    p.add_argument("--decode_radius", type=int, default=3, help="local 解碼的範圍（熱度圖格數，56x56）")
     p.add_argument("--hm_relu", type=int, default=0,
                    help="attn_kp_fc=0 時熱度圖輸出層是否保留官方的 ReLU（0 = 移除，避免 dead ReLU；1 = 官方原版）")
     p.add_argument("--reinit_hm_head", type=int, default=1,
