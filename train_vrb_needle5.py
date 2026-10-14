@@ -218,6 +218,28 @@ def build_vrb(args):
 HM_CACHE = {}
 
 
+def fix_heatmap_head(net, remove_relu=True, reinit=True):
+    """attn_kp_fc=0 的熱度圖輸出層 cb3 = Conv1x1 -> BatchNorm -> ReLU。
+    - 官方 pretrained 用的是 fc 路徑，cb3 沒被訓練過；ReLU 會把負值全變 0，
+      熱度圖整張為 0 時梯度也是 0（dead ReLU），永遠學不動、5 點全部停在中心。
+    - remove_relu：把最後的 ReLU 換成 Identity，讓熱度圖可以有負值（= 不是這裡），softmax 才有意義
+    - reinit：重新初始化 cb3（卷積權重 + BatchNorm 統計量），避免一開始就整片為負
+    （架構其他部分與官方相同；這是對官方 cb3 的修改，寫報告時請註明）"""
+    head = net.cb3
+    if remove_relu and hasattr(head, "relu"):
+        head.relu = nn.Identity()
+        print("[NOTE] 已移除熱度圖輸出層 cb3 最後的 ReLU（避免 dead ReLU）")
+    if reinit:
+        nn.init.normal_(head.conv.weight, std=0.01)
+        if head.conv.bias is not None:
+            nn.init.zeros_(head.conv.bias)
+        if hasattr(head, "norm") and isinstance(head.norm, nn.modules.batchnorm._BatchNorm):
+            head.norm.reset_running_stats()
+            nn.init.ones_(head.norm.weight)
+            nn.init.zeros_(head.norm.bias)
+        print("[NOTE] 已重新初始化熱度圖輸出層 cb3")
+
+
 def patch_get_coord(beta):
     """把官方 networks.model.get_coord 換成 2D softmax(beta * x) 的邊際分布版本（簽名與回傳格式相同）。"""
     import torch.nn.functional as F
@@ -304,6 +326,7 @@ def evaluate(net, loader, device, args, vis_dir=None):
     sum_err = torch.zeros(5)
     sum_err_ord = torch.zeros(5)
     n, loss_sum, flips = 0, 0.0, 0
+    zero_sum = 0.0
     for batch in loader:
         img = batch["img"].to(device)
         gt = batch["pts"].to(device)
@@ -311,6 +334,8 @@ def evaluate(net, loader, device, args, vis_dir=None):
         pred = predict_xy(net, img, args)
         hm = HM_CACHE.get("x")
         hm = hm.float().cpu().numpy() if hm is not None else None
+        if hm is not None:
+            zero_sum += float((hm == 0).mean()) * img.shape[0]
         loss_sum += contact_loss(pred, gt, args.loss).item() * img.shape[0]
         side = batch["crop"][:, 2].to(device)[:, None]
         err = (pred - gt).norm(dim=-1) * side                                # (B, 5) 原圖 pixel
@@ -338,7 +363,7 @@ def evaluate(net, loader, device, args, vis_dir=None):
     per = (sum_err / max(n, 1)).tolist()
     per_ord = (sum_err_ord / max(n, 1)).tolist()
     m = {"loss": loss_sum / max(n, 1), "mean_px": float(np.mean(per)), "flip_rate": flips / max(n, 1),
-         "mean_px_ordered": float(np.mean(per_ord))}
+         "mean_px_ordered": float(np.mean(per_ord)), "hm_zero_frac": zero_sum / max(n, 1)}
     m.update({f"{k}_px": v for k, v in zip(POINT_NAMES, per)})
     return m
 
@@ -607,6 +632,9 @@ def main(args):
         _M.get_coord = _capture
     if resume_state is None:
         load_pretrained(net, args.pretrained)
+    if not args.attn_kp_fc:
+        fix_heatmap_head(net, remove_relu=args.hm_relu == 0,
+                         reinit=bool(args.reinit_hm_head) and resume_state is None)
     net = net.to(device)
 
     backbone = list(net.r3m.parameters())
@@ -704,7 +732,8 @@ def main(args):
                 rec["val"] = vm
                 msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else ''} {vm['mean_px']:.1f}px (head {vm['head_px']:.1f} tail {vm['tail_px']:.1f} "
                         f"mid {vm['middle_px']:.1f} h1/3 {vm['head_1_3_px']:.1f} t1/3 {vm['tail_1_3_px']:.1f}) "
-                        f"flip {vm['flip_rate']:.0%}")
+                        f"flip {vm['flip_rate']:.0%}"
+                        + (f" hm0 {vm['hm_zero_frac']:.0%}" if not args.attn_kp_fc else ""))
                 if vm["mean_px"] < best:
                     best = vm["mean_px"]
                     torch.save(net.state_dict(), os.path.join(run_dir, "model_best.pth.tar"))
@@ -775,6 +804,10 @@ if __name__ == "__main__":
     p.add_argument("--resnet_type", type=str, default="resnet18")
     p.add_argument("--attn_kp", type=int, default=1)
     p.add_argument("--attn_kp_fc", type=int, default=1, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
+    p.add_argument("--hm_relu", type=int, default=0,
+                   help="attn_kp_fc=0 時熱度圖輸出層是否保留官方的 ReLU（0 = 移除，避免 dead ReLU；1 = 官方原版）")
+    p.add_argument("--reinit_hm_head", type=int, default=1,
+                   help="attn_kp_fc=0 時重新初始化熱度圖輸出層 cb3（官方 pretrained 沒訓練過這層）")
     p.add_argument("--hm_weight", type=float, default=0.1,
                    help="attn_kp_fc=0 且 kp_beta>0 時，高斯 heatmap 監督（KL）的權重；0 = 關閉")
     p.add_argument("--hm_sigma", type=float, default=1.5, help="目標高斯的標準差（heatmap 格數，56x56）")
