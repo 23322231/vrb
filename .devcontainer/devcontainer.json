@@ -31,7 +31,8 @@
 
   "mounts": [
     "type=bind,source=${localWorkspaceFolder}/../GroundingDINO,target=/workspaces/GroundingDINO",
-    "type=bind,source=${localWorkspaceFolder}/../LangSAM,target=/workspaces/LangSAM"
+    "type=bind,source=${localWorkspaceFolder}/../LangSAM,target=/workspaces/LangSAM",
+    "type=bind,source=/home/c23322231/AI_Robot_ws/data,target=/data,readonly"
   ],
 
   "containerEnv": {

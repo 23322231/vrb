@@ -3,8 +3,9 @@
 """
 把 mask_to_needle5.py 的標註，做成「離線增強」的 VRB 訓練資料集：
 
-    1. 依 8:1:1 重新切分 train / val / test（以「影像」為單位分組，同一張圖的多根針一定在同一組；
-       檔名只差 left_/right_ 的立體影像也視為同一組，避免同一瞬間的畫面同時出現在 train 與 test）
+    1. 依 8:1:1 重新切分 train / val / test：
+       - 自己的影片（Images/<clip>/...）：以 clip 為單位，同一段影片的連續影格一定在同一組
+       - 學長資料（Images/train|val|test/...）：以影像為單位，left_/right_ 立體影像視為同一組
     2. train：每根針存 1 張「無增強」裁切 + n_aug 張隨機增強（裁切縮放/位移、水平/上下翻轉、旋轉、色彩）
        val / test：每根針只存 1 張固定裁切（不做任何隨機增強，才能反映真實表現）
     3. 每張都是 224x224 的裁切圖，5 點座標直接是裁切圖內的 normalized (x, y)
@@ -135,8 +136,17 @@ def make_aug(img, pts, bbox, a, rng):
 # -----------------------------------------------------------------------------
 # 切分
 # -----------------------------------------------------------------------------
-def group_key(rel, pattern):
-    stem = os.path.splitext(os.path.basename(rel))[0]
+SPLIT_NAMES = {"train", "val", "valid", "validation", "test"}
+
+
+def group_key(rel, pattern, group_by):
+    """image：同一張圖（left_/right_ 合併）為一組；folder：第一層資料夾（= 一段 clip）為一組。"""
+    parts = rel.replace("\\", "/").split("/")
+    if group_by == "auto":
+        group_by = "folder" if len(parts) > 1 and parts[0].lower() not in SPLIT_NAMES else "image"
+    if group_by == "folder":
+        return "clip:" + parts[0]
+    stem = os.path.splitext(parts[-1])[0]
     return re.sub(pattern, "", stem, flags=re.IGNORECASE) if pattern else stem
 
 
@@ -146,6 +156,9 @@ def split_groups(keys, ratios, seed):
     n = len(keys)
     n_tr = int(round(n * ratios[0] / sum(ratios)))
     n_va = int(round(n * ratios[1] / sum(ratios)))
+    if n >= 3 and ratios[1] > 0 and ratios[2] > 0:    # 組數很少（例如只有幾段 clip）時，val / test 至少各 1 組
+        n_va = max(n_va, 1)
+        n_tr = min(n_tr, n - n_va - 1)
     out = {}
     for i, k in enumerate(keys):
         out[k] = "train" if i < n_tr else ("val" if i < n_tr + n_va else "test")
@@ -168,6 +181,11 @@ def main():
     ap.add_argument("--images_root", default=None, help="原始影像根目錄（預設用 annotations.json 裡的）")
     ap.add_argument("--out_dir", default="needle5_aug")
     ap.add_argument("--ratios", type=float, nargs=3, default=[8, 1, 1], metavar=("TRAIN", "VAL", "TEST"))
+    ap.add_argument("--group_by", choices=["auto", "image", "folder"], default="auto",
+                    help="切分單位：auto（第一層資料夾是 train/val/test 時以影像為單位，否則以資料夾 = clip 為單位）")
+    ap.add_argument("--chunks_per_clip", type=int, default=0,
+                    help="把每段 clip 依時間切成 K 個連續區段分別當一組（只有 1~2 段影片時用，例如 10）")
+    ap.add_argument("--chunk_gap", type=int, default=2, help="區段交界丟掉的影格數（避免相鄰影格跨組）")
     ap.add_argument("--group_regex", default=r"^(left|right)[_-]?",
                     help="從檔名移除這段後相同的影像視為同一組（預設合併 left_/right_ 立體影像）；'' = 不合併")
     ap.add_argument("--split_file", default=None, help="沿用之前的 split.json（重做增強時切分保持不變）")
@@ -206,9 +224,40 @@ def main():
         with open(a.split_file) as f:
             img_split = json.load(f)["image_split"]
     else:
-        keys = {s["image"]: group_key(s["image"], a.group_regex) for s in src}
+        keys = {s["image"]: group_key(s["image"], a.group_regex, a.group_by) for s in src}
+        chunk_info = {}
+        if a.chunks_per_clip > 1:
+            # 同一段 clip 依時間（檔名順序）切成 K 個連續區段，每段當一組
+            by_clip = {}
+            for rel, k in keys.items():
+                if k.startswith("clip:"):
+                    by_clip.setdefault(k, []).append(rel)
+            for k, rels in by_clip.items():
+                rels.sort()
+                n = len(rels)
+                for r_i, rel in enumerate(rels):
+                    c = min(r_i * a.chunks_per_clip // n, a.chunks_per_clip - 1)
+                    keys[rel] = f"{k}#t{c:02d}"
+                    chunk_info[rel] = (k, r_i, rels)
         gsplit = split_groups(keys.values(), a.ratios, a.seed)
         img_split = {rel: gsplit[k] for rel, k in keys.items()}
+        if chunk_info and a.chunk_gap > 0:
+            # 相鄰區段被分到不同組時，交界附近 chunk_gap 張不使用（避免幾乎一樣的影格跨組）
+            dropped = set()
+            for rel, (k, r_i, rels) in chunk_info.items():
+                for d in range(1, a.chunk_gap + 1):
+                    for nb in (r_i - d, r_i + d):
+                        if 0 <= nb < len(rels) and img_split[rels[nb]] != img_split[rel]:
+                            dropped.add(rel)
+            if dropped:
+                print(f"區段交界丟掉 {len(dropped)} 張（--chunk_gap {a.chunk_gap}）")
+                src = [x for x in src if x["image"] not in dropped]
+                img_split = {r: v for r, v in img_split.items() if r not in dropped}
+        n_groups = len(set(keys.values()))
+        print(f"切分單位：{'clip（資料夾）' if any(k.startswith('clip:') for k in keys.values()) else '影像'}，共 {n_groups} 組")
+        for sp in ("train", "val", "test"):
+            gs = sorted({k for k in keys.values() if gsplit[k] == sp})
+            print(f"  {sp:5s}: {len(gs)} 組" + (f"  {[g[5:] for g in gs]}" if gs and gs[0].startswith("clip:") else ""))
     os.makedirs(a.out_dir, exist_ok=True)
     with open(os.path.join(a.out_dir, "split.json"), "w") as f:
         json.dump({"ratios": a.ratios, "group_regex": a.group_regex, "seed": a.seed,
