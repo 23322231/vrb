@@ -215,6 +215,9 @@ def build_vrb(args):
                     attn_kp=args.attn_kp, attn_kp_fc=args.attn_kp_fc, n_maps=5)
 
 
+HM_CACHE = {}
+
+
 def patch_get_coord(beta):
     """把官方 networks.model.get_coord 換成 2D softmax(beta * x) 的邊際分布版本（簽名與回傳格式相同）。"""
     import torch.nn.functional as F
@@ -222,6 +225,7 @@ def patch_get_coord(beta):
 
     def get_coord(x, other_axis, axis_size):
         B, C, Hh, Ww = x.shape
+        HM_CACHE["x"] = x                                                   # 給 heatmap loss 用
         p2 = F.softmax(beta * x.reshape(B, C, -1), dim=-1).reshape(B, C, Hh, Ww)
         g_c_prob = p2.sum(dim=other_axis)                                   # 邊際分布 (B, C, axis)
         coord_pt = torch.linspace(0, 1.0, axis_size, device=x.device).view(1, 1, axis_size)
@@ -256,6 +260,32 @@ def predict_xy(net, img, args):
     return mu
 
 
+def heatmap_loss(gt, args):
+    """DSNT / 高斯 heatmap 監督：每個點的目標是以 GT 為中心的 2D 高斯分布，
+    與 softmax(beta * heatmap) 算 KL divergence。讓每個 channel 在「正確位置」形成單一尖峰，
+    避免座標只靠加權平均學、被拉向中心。sym 模式同樣取頭尾互換較小者。"""
+    import torch.nn.functional as F
+    x = HM_CACHE.get("x")
+    if x is None:
+        return torch.zeros((), device=gt.device)
+    B, C, Hh, Ww = x.shape
+    ys = torch.linspace(0, 1, Hh, device=x.device).view(1, 1, Hh, 1)
+    xs = torch.linspace(0, 1, Ww, device=x.device).view(1, 1, 1, Ww)
+    sig = args.hm_sigma / (Ww - 1)
+    logp = F.log_softmax(args.kp_beta * x.float().reshape(B, C, -1), dim=-1)
+
+    def kl(g):
+        t = torch.exp(-((xs - g[..., 0, None, None]) ** 2 + (ys - g[..., 1, None, None]) ** 2) / (2 * sig ** 2))
+        t = t.reshape(B, C, -1)
+        t = t / t.sum(-1, keepdim=True).clamp_min(1e-12)
+        return (t * (torch.log(t.clamp_min(1e-12)) - logp)).sum(-1).mean(-1)   # (B,)
+
+    per = kl(gt)
+    if args.loss == "sym":
+        per = torch.minimum(per, kl(gt[:, SWAP_HEAD_TAIL]))
+    return per.mean()
+
+
 def contact_loss(pred, gt, mode):
     """與官方 obj_loss 相同：5 * mean((mu - gt)^2)。sym：每筆取正序 / 頭尾互換較小者。"""
     per = ((pred - gt) ** 2).mean(dim=(1, 2))                                 # (B,)
@@ -272,16 +302,26 @@ def contact_loss(pred, gt, mode):
 def evaluate(net, loader, device, args, vis_dir=None):
     net.eval()
     sum_err = torch.zeros(5)
+    sum_err_ord = torch.zeros(5)
     n, loss_sum, flips = 0, 0.0, 0
     for batch in loader:
         img = batch["img"].to(device)
         gt = batch["pts"].to(device)
+        HM_CACHE.pop("x", None)
         pred = predict_xy(net, img, args)
+        hm = HM_CACHE.get("x")
+        hm = hm.float().cpu().numpy() if hm is not None else None
         loss_sum += contact_loss(pred, gt, args.loss).item() * img.shape[0]
         side = batch["crop"][:, 2].to(device)[:, None]
         err = (pred - gt).norm(dim=-1) * side                                # (B, 5) 原圖 pixel
         err_sw = (pred - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1) * side
-        flips += int((err_sw.mean(1) < err.mean(1)).sum())
+        flipped = err_sw.mean(1) < err.mean(1)                               # (B,)
+        flips += int(flipped.sum())
+        sum_err_ord += err.sum(0).cpu()
+        if args.loss == "sym":
+            # sym：頭尾順序不計，把 GT 對齊到較接近的那個方向再算誤差（畫圖也用對齊後的 GT）
+            gt = torch.where(flipped[:, None, None], gt[:, SWAP_HEAD_TAIL], gt)
+            err = torch.where(flipped[:, None], err_sw, err)
         sum_err += err.sum(0).cpu()
         n += img.shape[0]
         if vis_dir:
@@ -289,10 +329,52 @@ def evaluate(net, loader, device, args, vis_dir=None):
             for b in range(img.shape[0]):
                 draw(batch["img_raw"][b].numpy(), gt[b].cpu().numpy(), pred[b].cpu().numpy(),
                      os.path.join(vis_dir, batch["name"][b]))
+                if hm is not None:
+                    hdir = os.path.join(vis_dir, "heatmaps")
+                    os.makedirs(hdir, exist_ok=True)
+                    draw_heatmaps(batch["img_raw"][b].numpy(), hm[b], gt[b].cpu().numpy(),
+                                  pred[b].cpu().numpy(), args.kp_beta if args.kp_beta > 0 else 1.0,
+                                  os.path.join(hdir, batch["name"][b]))
     per = (sum_err / max(n, 1)).tolist()
-    m = {"loss": loss_sum / max(n, 1), "mean_px": float(np.mean(per)), "flip_rate": flips / max(n, 1)}
+    per_ord = (sum_err_ord / max(n, 1)).tolist()
+    m = {"loss": loss_sum / max(n, 1), "mean_px": float(np.mean(per)), "flip_rate": flips / max(n, 1),
+         "mean_px_ordered": float(np.mean(per_ord))}
     m.update({f"{k}_px": v for k, v in zip(POINT_NAMES, per)})
     return m
+
+
+def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224):
+    """每個點一格：裁切圖 + 該點的機率分布 softmax(beta * heatmap)（JET 色階疊在影像上）。
+    實心點 = GT、空心圈 = 預測。格子上方標出分布最大機率 pmax 與熵比例（越接近 0 越集中、越接近 1 越平）。
+    - 尖峰落在針的正確部位 -> 有學到
+    - 整片均勻 / 尖峰在中心 -> 還沒學到（或 beta 太小）
+    - 5 張圖的尖峰都在同一處 -> 五個部位分不開"""
+    base = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    base = cv2.resize(base, (tile, tile), interpolation=cv2.INTER_LINEAR)
+    C, Hh, Ww = hm_logits.shape
+    tiles = []
+    for c in range(C):
+        z = beta * hm_logits[c].astype(np.float64)
+        z = z - z.max()
+        p = np.exp(z)
+        p /= p.sum()
+        ent = float(-(p * np.log(p + 1e-12)).sum() / np.log(p.size))
+        rng = p.max() - p.min()
+        vis = ((p - p.min()) / rng * 255).astype(np.uint8) if rng > 1e-9 else np.zeros_like(p, np.uint8)
+        vis = cv2.resize(vis, (tile, tile), interpolation=cv2.INTER_LINEAR)
+        over = cv2.addWeighted(base, 0.55, cv2.applyColorMap(vis, cv2.COLORMAP_JET), 0.45, 0)
+        col = POINT_COLORS[c]
+        P = lambda q: (int(round(q[0] * tile)), int(round(q[1] * tile)))
+        cv2.circle(over, P(gt[c]), 3, col, -1, cv2.LINE_AA)
+        cv2.circle(over, P(gt[c]), 4, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(over, P(pred[c]), 6, col, 2, cv2.LINE_AA)
+        head = np.zeros((34, tile, 3), np.uint8)
+        cv2.putText(head, POINT_NAMES[c], (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+        cv2.putText(head, f"pmax {p.max():.3f}  H {ent:.2f}", (6, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (220, 220, 220), 1, cv2.LINE_AA)
+        tiles.append(np.vstack([head, over]))
+        tiles.append(np.full((tile + 34, 4, 3), 40, np.uint8))
+    cv2.imwrite(path, np.hstack(tiles[:-1]))
 
 
 def draw(img_rgb, gt, pred, path, scale=3, r=2):
@@ -379,6 +461,10 @@ def plot_curves(run_dir):
                     alpha=0.85, label=name)
         vm = [recs[e]["val"]["mean_px"] for e in ve]
         ax.plot(ve, vm, color=ink, linewidth=2.4, label="val mean")
+        bpath = os.path.join(run_dir, "baseline.json")
+        if os.path.isfile(bpath):
+            bm = json.load(open(bpath))["mean_px"]
+            ax.axhline(bm, color=muted, linewidth=1.2, linestyle=":", label=f"baseline: mean shape ({bm:.1f}px)")
         te = [e for e in ep if "train_eval" in recs[e]]
         if te:
             ax.plot(te, [recs[e]["train_eval"]["mean_px"] for e in te], color=ink, linewidth=1.5,
@@ -388,7 +474,11 @@ def plot_curves(run_dir):
         ax.scatter([ve[b]], [vm[b]], s=40, color=ink, edgecolors="white", linewidths=1.5, zorder=3)
         ax.annotate(f"best {vm[b]:.1f}px @ ep {ve[b]}", (ve[b], vm[b]), xytext=(-8 if right else 8, -16),
                     textcoords="offset points", fontsize=9, color=ink, ha="right" if right else "left")
-    ax.set_title("Point error in original-image pixels", color=ink, fontsize=11, loc="left")
+    sym_note = ""
+    apath = os.path.join(run_dir, "args.json")
+    if os.path.isfile(apath) and json.load(open(apath)).get("loss") == "sym":
+        sym_note = " (head/tail order ignored)"
+    ax.set_title("Point error in original-image pixels" + sym_note, color=ink, fontsize=11, loc="left")
     ax.set_ylabel("px", color=muted)
     ax.set_ylim(bottom=0)
     ax.legend(frameon=False, fontsize=8, ncol=2, labelcolor=ink)
@@ -508,6 +598,13 @@ def main(args):
         patch_get_coord(args.kp_beta)
     elif not args.attn_kp_fc:
         print("[WARN] attn_kp_fc=0 但 kp_beta=0：使用官方 get_coord，5 點很可能都縮到裁切中心")
+        import networks.model as _M
+        _orig = _M.get_coord
+
+        def _capture(x, other_axis, axis_size):                      # 只記錄 heatmap，計算照官方
+            HM_CACHE["x"] = x
+            return _orig(x, other_axis, axis_size)
+        _M.get_coord = _capture
     if resume_state is None:
         load_pretrained(net, args.pretrained)
     net = net.to(device)
@@ -535,7 +632,8 @@ def main(args):
             g["lr"] = b * f
 
     start_epoch, step, best = 1, 0, float("inf")
-    if resume_state is not None:
+    resumed = resume_state is not None
+    if resumed:
         net.load_state_dict(resume_state["model"])
         optim.load_state_dict(resume_state["optim"])
         start_epoch, step, best = resume_state["epoch"] + 1, resume_state["step"], resume_state["best"]
@@ -545,7 +643,29 @@ def main(args):
         torch.set_rng_state(r["torch"])
         torch.cuda.set_rng_state_all(r["cuda"])
         del resume_state
-    elif val_loader:
+    use_hm = (not args.attn_kp_fc) and args.kp_beta > 0 and args.hm_weight > 0
+    if use_hm:
+        print(f"[NOTE] 加上 heatmap 監督：weight={args.hm_weight}, sigma={args.hm_sigma} 格（56x56 heatmap）")
+
+    # 平均位置 baseline：每個點都預測「訓練集該點的平均位置」，模型至少要比這個好
+    if val_loader and not resumed:
+        tr_pts = torch.stack([train_eval_set[i]["pts"] for i in range(len(train_eval_set))]).mean(0)
+        errs = []
+        for b in val_loader:
+            e_o = (tr_pts[None] - b["pts"]).norm(dim=-1) * b["crop"][:, 2:3]
+            if args.loss == "sym":
+                e_s = (tr_pts[None] - b["pts"][:, SWAP_HEAD_TAIL]).norm(dim=-1) * b["crop"][:, 2:3]
+                e_o = torch.where((e_s.mean(1) < e_o.mean(1))[:, None], e_s, e_o)
+            errs.append(e_o)
+        e = torch.cat(errs).mean(0)
+        base = {"mean_px": float(e.mean()), **{f"{k}_px": float(v) for k, v in zip(POINT_NAMES, e)}}
+        with open(os.path.join(run_dir, "baseline.json"), "w") as f:
+            json.dump(base, f, indent=2)
+        print(f"[baseline：一律預測訓練集平均位置] val mean {base['mean_px']:.1f}px  "
+              + "  ".join(f"{k} {base[k + '_px']:.1f}" for k in POINT_NAMES))
+        print("  -> 模型的 val mean 若和這個差不多，代表它只學到「平均形狀」，沒有真的看圖找針")
+
+    if val_loader and not resumed:
         m = evaluate(net, val_loader, device, args, os.path.join(run_dir, "vis", "epoch0000_val"))
         print("[pretrained] val: " + "  ".join(f"{k}={v:.3f}" for k, v in m.items()))
 
@@ -564,6 +684,8 @@ def main(args):
                 img = batch["img"].to(device)
                 gt = batch["pts"].to(device)
                 loss = contact_loss(predict_xy(net, img, args), gt, args.loss)
+                if use_hm:
+                    loss = loss + args.hm_weight * heatmap_loss(gt, args)
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 if args.grad_clip > 0:
@@ -580,7 +702,7 @@ def main(args):
                 vm = evaluate(net, val_loader, device, args,
                               os.path.join(run_dir, "vis", f"epoch{epoch:04d}_val") if do_vis else None)
                 rec["val"] = vm
-                msg += (f" | val mean {vm['mean_px']:.1f}px (head {vm['head_px']:.1f} tail {vm['tail_px']:.1f} "
+                msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else ''} {vm['mean_px']:.1f}px (head {vm['head_px']:.1f} tail {vm['tail_px']:.1f} "
                         f"mid {vm['middle_px']:.1f} h1/3 {vm['head_1_3_px']:.1f} t1/3 {vm['tail_1_3_px']:.1f}) "
                         f"flip {vm['flip_rate']:.0%}")
                 if vm["mean_px"] < best:
@@ -653,6 +775,9 @@ if __name__ == "__main__":
     p.add_argument("--resnet_type", type=str, default="resnet18")
     p.add_argument("--attn_kp", type=int, default=1)
     p.add_argument("--attn_kp_fc", type=int, default=1, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
+    p.add_argument("--hm_weight", type=float, default=0.1,
+                   help="attn_kp_fc=0 且 kp_beta>0 時，高斯 heatmap 監督（KL）的權重；0 = 關閉")
+    p.add_argument("--hm_sigma", type=float, default=1.5, help="目標高斯的標準差（heatmap 格數，56x56）")
     p.add_argument("--kp_beta", type=float, default=0,
                    help="attn_kp_fc=0 時的 softmax 溫度倒數；>0 會改用 2D softmax（建議 10~30），0 = 官方原版")
     p.add_argument("--traj_len", type=int, default=5)
