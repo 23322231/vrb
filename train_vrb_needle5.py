@@ -13,10 +13,43 @@
 - --attn_kp_fc 1（官方預設）：全域池化 + 全連接層直接回歸座標
   --attn_kp_fc 0           ：官方原始碼的另一條路徑，每個點一張 heatmap 再取 soft-argmax。
                              注意官方這條路徑輸出 (y, x)，本程式已自動轉換。
-                             官方的 get_coord 會先對整列取平均再 softmax，heatmap 又經過 ReLU，
-                             分布幾乎是均勻的 -> 5 點都會縮到裁切中心（實測現象）。
-                             --kp_beta > 0 時改用「2D softmax(beta * heatmap)」再取邊際分布，
-                             這是對官方 get_coord 的修改（架構/權重不變，只改這個無參數的函式）
+
+attn_kp_fc 0 的架構（與官方 networks/model.py 相同，分 5 段；--freeze_upto 依這個順序凍結）:
+    backbone  ResNet18（R3M）conv1 ~ layer4                       官方 pretrained
+    decoder   deconv1/2/3 + bn1/2/3 + ReLU（含 layer3、layer2 skip） 官方 pretrained   -> 56x56x64
+    cb        cb1、cb2：Conv3x3-BN-ReLU x2                          官方 pretrained   -> 56x56x64
+    attn      位置編碼 + nn.MultiheadAttention                       官方 pretrained
+    head      cb3：Conv1x1-BN-ReLU                                  官方 ckpt 有這層，但官方訓練走 fc 路徑、
+                                                                    cb3 從未被訓練 -> 預設重新初始化  -> 56x56x5 heatmap
+    每次新訓練會在 run 資料夾寫 init_report.md：每一層的初始化來源、是否用到、是否訓練、學習率（寫報告用）
+
+對官方程式的修改（全部是選項，預設值如下）:
+    1. get_coord：官方是「先沿一軸取平均再 softmax」，分布幾乎均勻 -> 5 點縮到中心。
+       --kp_beta > 0 改成 2D softmax(beta * heatmap) 的邊際分布（無參數函式，不影響權重）
+    2. 高斯 heatmap KL 監督（--hm_weight），只是多一個 loss
+    3. cb3 最後的 ReLU：預設保留（--hm_relu 1 = 官方原版）；--hm_relu 0 才拿掉
+    4. --attn_mode：官方的 nn.MultiheadAttention 沒設 batch_first，輸入 (B, H*W, C) 會被當成
+       (序列 = B, batch = H*W)，也就是「同一個位置、跨 batch 裡不同影像」做 attention，不是空間 attention。
+       official（預設）= 照原版；spatial = 改成 56x56 個位置之間的 attention（權重形狀相同，可載入 pretrained）
+
+segmentation 輔助頭（--seg_weight > 0，且資料有 mask 時才啟用；mask 由 build_needle5_aug.py 產生）:
+    attn 輸出 56x56x64 ─┬→ cb3（官方）        -> 5 張 keypoint heatmap（VRB 的輸出，不變）
+                        └→ seg_head（新增）   -> 1 張「這個像素是不是針」56x56（只在訓練時加 loss）
+    seg_head 是 Conv1x1(64→1)：刻意只用線性讀出，讓「分辨針 / 背景 / 夾爪」的能力必須長在共用的
+    decoder / cb / attn 特徵裡（keypoint 也讀同一份特徵）。loss = BCE(pos_weight) + Dice，mask 以面積平均縮到 56x56。
+    評估時印出 seg IoU / precision / recall；heatmaps/*.png 第 6 格是預測的針 mask（綠框 = GT）。
+    參考：Laina et al., MICCAI 2017（手術器械 segmentation + landmark heatmap 共同訓練）
+
+特徵圖檢查（--feat_probe 1，預設開啟；在 epoch 0 = pretrained 與每 --vis_every 個 epoch 執行）:
+    對 layer1~4、decoder 3 層、cb2、attn 共 9 層特徵圖：
+    - energy：每個位置特徵向量的長度（L2）-> 這層「在看哪裡」
+    - 原型相似度：用 train 原圖在 GT 5 點的特徵取平均當「原型」，val 每張圖每個位置與原型的 cosine 相似度
+      -> 第 k 張圖的尖峰若落在第 k 個點上，代表這層特徵已經能找到那個部位（這個檢查不經過 cb3）
+    - 數字（存在 feat_log.jsonl，曲線在 features.png）：
+        argmax_err_px  相似度最高處與 GT 的距離（原圖 pixel）
+        proto_acc      在 GT 5 個位置，特徵最像哪個原型（5 選 1，隨機 = 20%）
+        head_tail_acc  在針頭 / 針尾位置，分不分得出頭和尾（2 選 1，隨機 = 50%）
+    - 圖：vis/epochXXXX_val/features/*.png（列 = 9 層；欄 = 原圖、energy、5 個點的相似度）
 - 裁切：以針的框為中心的正方形，邊長 = 框長邊 + 2*pad（pad = max(box_pad, box_pad_ratio*長邊)），
         再縮成 224x224。訓練時加隨機縮放 / 位移 / 翻轉 / 旋轉（--rot_deg）
 - 每次訓練存到 <out_dir>_<開始時間>/，可用 --resume 接續
@@ -69,6 +102,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -79,6 +113,7 @@ POINT_COLORS = [(0, 0, 255), (255, 0, 0), (0, 200, 0), (0, 140, 255), (255, 255,
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 CKPT_NAME = "checkpoint_last.pth"
+SEG_SIZE = 56                                    # heatmap / segmentation 解析度
 
 
 # -----------------------------------------------------------------------------
@@ -176,6 +211,8 @@ class Needle5Dataset(Dataset):
             "crop": torch.tensor([x0, y0, side], dtype=torch.float32),
             "name": f"{os.path.splitext(os.path.basename(s['image']))[0]}_n{s['needle_id']}.png",
             "src": s.get("_src", "data"),
+            "mask": torch.zeros(1, SEG_SIZE, SEG_SIZE),                       # 線上增強資料不支援 mask
+            "has_mask": torch.tensor(0.0),
         }
 
 
@@ -200,6 +237,13 @@ class Needle5CropDataset(Dataset):
         name = os.path.basename(s["image"])
         if s.get("_multi"):                       # 多個資料集合併時，檔名前加上資料集名稱避免撞名
             name = f"{s['_src']}__{name}"
+        mask, has = torch.zeros(1, SEG_SIZE, SEG_SIZE), 0.0
+        if s.get("mask"):
+            m = cv2.imread(os.path.join(s.get("_root", self.root), s["mask"]), cv2.IMREAD_GRAYSCALE)
+            if m is not None:
+                # 面積平均縮到 56x56：細針不會消失，值 = 該格有多少比例是針
+                m = cv2.resize(m, (SEG_SIZE, SEG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+                mask, has = torch.from_numpy(m)[None], 1.0
         return {
             "img": self.tf(img),
             "img_raw": torch.from_numpy(np.asarray(img).copy()),
@@ -207,6 +251,8 @@ class Needle5CropDataset(Dataset):
             "crop": torch.tensor([0, 0, s["side_px"]], dtype=torch.float32),   # side_px：誤差換算回原圖 pixel
             "name": name,
             "src": s.get("_src", "data"),
+            "mask": mask,
+            "has_mask": torch.tensor(has),
         }
 
 
@@ -233,17 +279,15 @@ def build_vrb(args):
 HM_CACHE = {}
 
 
-def fix_heatmap_head(net, remove_relu=True, reinit=True):
-    """attn_kp_fc=0 的熱度圖輸出層 cb3 = Conv1x1 -> BatchNorm -> ReLU。
-    - 官方 pretrained 用的是 fc 路徑，cb3 沒被訓練過；ReLU 會把負值全變 0，
-      熱度圖整張為 0 時梯度也是 0（dead ReLU），永遠學不動、5 點全部停在中心。
-    - remove_relu：把最後的 ReLU 換成 Identity，讓熱度圖可以有負值（= 不是這裡），softmax 才有意義
-    - reinit：重新初始化 cb3（卷積權重 + BatchNorm 統計量），避免一開始就整片為負
-    （架構其他部分與官方相同；這是對官方 cb3 的修改，寫報告時請註明）"""
+def fix_heatmap_head(net, remove_relu=False, reinit=True):
+    """attn_kp_fc=0 的熱度圖輸出層 cb3 = Conv1x1 -> BatchNorm -> ReLU（官方原版）。
+    - 官方 pretrained 是用 fc 路徑訓練的，cb3 雖然存在 checkpoint 裡，但從來沒有被訓練過（等於隨機值）
+    - reinit：重新初始化 cb3（卷積權重 std=0.01 + BatchNorm 統計量歸零），從頭訓練這一層
+    - remove_relu：把最後的 ReLU 換成 Identity（--hm_relu 0；預設不拿掉，維持官方架構）"""
     head = net.cb3
     if remove_relu and hasattr(head, "relu"):
         head.relu = nn.Identity()
-        print("[NOTE] 已移除熱度圖輸出層 cb3 最後的 ReLU（避免 dead ReLU）")
+        print("[NOTE] 已移除熱度圖輸出層 cb3 最後的 ReLU（--hm_relu 0，與官方架構不同）")
     if reinit:
         nn.init.normal_(head.conv.weight, std=0.01)
         if head.conv.bias is not None:
@@ -252,7 +296,62 @@ def fix_heatmap_head(net, remove_relu=True, reinit=True):
             head.norm.reset_running_stats()
             nn.init.ones_(head.norm.weight)
             nn.init.zeros_(head.norm.bias)
-        print("[NOTE] 已重新初始化熱度圖輸出層 cb3")
+        print("[NOTE] 已重新初始化熱度圖輸出層 cb3（官方 pretrained 沒訓練過這層）")
+
+
+def patch_attention(net, mode):
+    """官方：nn.MultiheadAttention(batch_first=False) 收到 (B, H*W, C)，實際是在「同一位置、跨 batch 影像」之間做 attention。
+    spatial：前後轉置，改成每張影像自己 H*W 個位置之間的 attention（權重 / state_dict 完全相同）。
+    只替換這個模組實例的 forward，不改官方原始碼。"""
+    if mode != "spatial":
+        print("[NOTE] attention 照官方原版（--attn_mode official）：沿 batch 維度做 attention，"
+              "預測會受同一 batch 其他影像影響；batch=1 時退化成逐位置的線性層")
+        return
+    mha = net.self_attention
+    orig = mha.forward
+
+    def forward(query, key, value, *a, **kw):
+        kw["need_weights"] = False                       # 用 scaled_dot_product_attention，不建出 3136x3136 權重矩陣
+        out, _ = orig(query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1), *a, **kw)
+        return out.transpose(0, 1), None
+
+    mha.forward = forward
+    print("[NOTE] attention 改為空間 attention（--attn_mode spatial）：每張影像 56x56 個位置之間互相注意")
+
+
+def add_seg_head(net):
+    """在 attention 輸出上加一個 Conv1x1(64→1) 的 segmentation 輔助頭，並掛 hook 取 attention 輸出。
+    seg_head 是 net 的子模組（會存進 state_dict / checkpoint）；官方 encode_img 不會呼叫它，不影響 5 點預測。"""
+    net.seg_head = nn.Conv2d(64, 1, kernel_size=1)
+    nn.init.normal_(net.seg_head.weight, std=0.01)
+    nn.init.constant_(net.seg_head.bias, -3.0)            # 起始預測「幾乎都不是針」（針只佔很少像素）
+
+    def hook(mod, inp, out):
+        o = out[0] if isinstance(out, tuple) else out     # (B, H*W, C)
+        B, N, C = o.shape
+        s_ = int(round(math.sqrt(N)))
+        HM_CACHE["attn"] = o.transpose(1, 2).reshape(B, C, s_, s_)
+    net.self_attention.register_forward_hook(hook)
+    print("[NOTE] 加上 segmentation 輔助頭 seg_head：attention 輸出 -> Conv1x1(64→1) -> 56x56 針 mask")
+
+
+def seg_logits(net):
+    f = HM_CACHE.get("attn")
+    return None if f is None or not hasattr(net, "seg_head") else net.seg_head(f)
+
+
+def seg_loss(logits, target, has, pos_weight, dice_w=1.0):
+    """BCE(pos_weight) + soft Dice；只對有 mask 的樣本計算。target：0~1（面積比例）。"""
+    if logits is None or has.sum() == 0:
+        return None
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none",
+                                             pos_weight=torch.tensor(pos_weight, device=logits.device))
+    bce = bce.mean(dim=(1, 2, 3))
+    p = torch.sigmoid(logits)
+    inter = (p * target).sum(dim=(1, 2, 3))
+    dice = 1 - (2 * inter + 1) / (p.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + 1)
+    per = bce + dice_w * dice
+    return (per * has).sum() / has.sum()
 
 
 def patch_get_coord(beta):
@@ -273,6 +372,7 @@ def patch_get_coord(beta):
 
 
 def load_pretrained(net, path):
+    """回傳 checkpoint 裡的 key 集合與 missing keys（給 init_report 用）。"""
     dt = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(dt, dict) and "state_dict" in dt and isinstance(dt["state_dict"], dict):
         dt = dt["state_dict"]
@@ -281,6 +381,117 @@ def load_pretrained(net, path):
     print(f"載入 pretrained: {path}")
     print(f"  missing keys   : {len(missing)} {missing[:10]}")
     print(f"  unexpected keys: {len(unexpected)} {unexpected[:10]}")
+    return {"keys": set(dt.keys()), "missing": set(missing), "path": path}
+
+
+# -----------------------------------------------------------------------------
+# 架構分段 / 凍結 / 初始化報告
+# -----------------------------------------------------------------------------
+STAGES = [
+    ("backbone", ["r3m"], "ResNet18（R3M）conv1 ~ layer4"),
+    ("decoder", ["deconv1", "bn1", "deconv2", "bn2", "deconv3", "bn3"], "3 層 deconv + BN + ReLU（含 skip）"),
+    ("cb", ["cb1", "cb2"], "cb1、cb2：Conv3x3-BN-ReLU x2"),
+    ("attn", ["self_attention"], "位置編碼 + MultiheadAttention"),
+    ("head", ["cb3"], "cb3：Conv1x1-BN-ReLU -> 5 張 heatmap"),
+]
+STAGE_OF = {m: name for name, mods, _ in STAGES for m in mods}
+
+
+def stage_modules(upto):
+    """--freeze_upto：回傳該 stage（含）之前所有模組名稱。"""
+    if upto in (None, "none"):
+        return []
+    out = []
+    for name, mods, _ in STAGES:
+        out += mods
+        if name == upto:
+            break
+    return out
+
+
+@torch.no_grad()
+def find_used_modules(net, device):
+    """跑一次 encode_img，記錄哪些子模組（含它底下任何一層）真的有被呼叫。
+    注意：官方 encode_img 不是呼叫 net.r3m(...)，而是直接呼叫 net.r3m.convnet.conv1 / layer1 ...，
+    所以要掛在「所有子層」上，再對應回最上層的名稱，否則 r3m 會被誤判成沒用到。"""
+    used = set()
+    hs = []
+    for top, child in net.named_children():
+        for _, m in child.named_modules():
+            hs.append(m.register_forward_hook(lambda mod, i, o, n=top: used.add(n)))
+    was_training = net.training
+    net.eval()
+    net.encode_img(torch.zeros(2, 3, 224, 224, device=device))
+    net.train(was_training)
+    for h in hs:
+        h.remove()
+    HM_CACHE.pop("x", None)
+    return used
+
+
+def write_init_report(net, run_dir, args, ckpt_info, reinit, frozen, used):
+    """每一層：stage / 參數量 / 初始化來源 / 是否用到 / 是否訓練 / 學習率 -> init_report.md"""
+    rows = []
+    for name, mod in net.named_children():
+        n_p = sum(p.numel() for p in mod.parameters())
+        keys = [f"{name}.{k}" for k in mod.state_dict().keys() if not k.endswith("num_batches_tracked")]
+        in_ckpt = bool(keys) and all(k in ckpt_info["keys"] for k in keys)
+        if name in reinit:
+            src = "重新初始化（本程式）"
+        elif in_ckpt:
+            src = "官方 pretrained"
+        elif not keys:
+            src = "（無參數）"
+        else:
+            src = "隨機初始化（checkpoint 沒有）"
+        if name == "cb3" and in_ckpt:
+            src += "；checkpoint 有此層，但官方訓練走 fc 路徑，從未被訓練"
+        is_used = name in used or name == "seg_head"
+        trained = is_used and name not in frozen and n_p > 0 and any(p.requires_grad for p in mod.parameters())
+        if n_p == 0:
+            tr = "（無參數）"
+        elif trained:
+            lr = args.lr * (args.backbone_lr_mult if name == "r3m" else 1.0)
+            tr = f"訓練（lr {lr:g}）"
+        elif not is_used:
+            tr = "未使用（attn_kp_fc=0 的 forward 不會經過）"
+        else:
+            tr = "凍結"
+        if name == "seg_head":
+            src = "新增（本程式），隨機初始化"
+            tr += "；segmentation 輔助任務，只在訓練時計算 loss，不參與 5 點預測"
+        rows.append((STAGE_OF.get(name, "seg（新增）" if name == "seg_head" else "-"), name, n_p, src,
+                     "是（只有 seg loss）" if name == "seg_head" else ("是" if is_used else "否"), tr))
+    order = {s[0]: i for i, s in enumerate(STAGES)}
+    order["seg（新增）"] = len(STAGES)
+    rows.sort(key=lambda r: (order.get(r[0], 99), r[1]))
+
+    L = ["# 模型初始化 / 訓練範圍報告", "",
+         f"- pretrained：`{ckpt_info['path']}`",
+         f"- attn_kp={args.attn_kp}, attn_kp_fc={args.attn_kp_fc}, n_maps=5（建構參數與官方 demo.py 相同）",
+         f"- freeze_upto={args.freeze_upto}, freeze_bn={args.freeze_bn}（1 = 所有 BatchNorm 用 pretrained 統計量，不更新）",
+         "", "| stage | 模組 | 參數量 | 初始化 | forward 有用到 | 訓練 |", "|---|---|---:|---|---|---|"]
+    for r in rows:
+        L.append(f"| {r[0]} | `{r[1]}` | {r[2]:,} | {r[3]} | {r[4]} | {r[5]} |")
+    L += ["", "## 與官方程式不同的地方", ""]
+    if not args.attn_kp_fc:
+        L.append(f"- 座標解碼 get_coord："
+                 + (f"改為 2D softmax(β·heatmap) 的邊際分布，β={args.kp_beta}（官方：先沿一軸平均再 softmax）"
+                    if args.kp_beta > 0 else "官方原版"))
+        L.append(f"- cb3 最後的 ReLU：{'保留（官方原版）' if args.hm_relu else '拿掉（Identity）'}")
+        if args.kp_beta > 0 and args.hm_weight > 0:
+            L.append(f"- 額外 loss：高斯 heatmap KL，權重 {args.hm_weight}，σ={args.hm_sigma} 格（56x56）")
+        L.append(f"- 評估解碼：{'local（argmax 附近 ±%d 格加權平均）' % args.decode_radius if args.decode == 'local' else '全圖 soft-argmax'}")
+    L.append(f"- attention：{'官方原版（沿 batch 維度）' if args.attn_mode == 'official' else '空間 attention（每張影像 H*W 個位置之間）'}")
+    if hasattr(net, "seg_head"):
+        L.append(f"- 新增 segmentation 輔助頭 seg_head（attention 輸出 → Conv1x1 → 56x56 針 mask），"
+                 f"loss = {args.seg_weight}×(BCE(pos_weight={args.seg_pos_weight}) + {args.seg_dice}×Dice)；"
+                 f"推論時不使用")
+    L.append(f"- loss：官方 obj_loss 公式 5·mean((μ−gt)²)，{'頭尾順序固定' if args.loss == 'ordered' else '頭尾互換取較小（sym）'}；不訓練軌跡分支")
+    txt = "\n".join(L) + "\n"
+    with open(os.path.join(run_dir, "init_report.md"), "w", encoding="utf-8") as f:
+        f.write(txt)
+    print("\n" + txt)
 
 
 def set_bn_eval(module):
@@ -361,16 +572,32 @@ def evaluate(net, loader, device, args, vis_dir=None):
     sum_err_global = torch.zeros(5)
     n, loss_sum, flips = 0, 0.0, 0
     zero_sum = 0.0
+    seg_tp = seg_fp = seg_fn = 0.0
+    seg_n = 0
+    dead = np.zeros(5)                           # 每個點：整張 heatmap <= 0 的樣本數（ReLU 全死 -> 分布均勻 -> 點落在中心）
     by_src = {}                                  # 每個資料集各自的誤差（多資料集合併訓練時用）
     for batch in loader:
         img = batch["img"].to(device)
         gt = batch["pts"].to(device)
         HM_CACHE.pop("x", None)
+        HM_CACHE.pop("attn", None)
         pred = predict_xy(net, img, args)
         hm_t = HM_CACHE.get("x")
+        sl = seg_logits(net)
+        seg_p = torch.sigmoid(sl).float() if sl is not None else None
+        has = batch["has_mask"].to(device) > 0
+        if seg_p is not None and has.any():
+            pb = seg_p[has] > 0.5
+            tb = batch["mask"].to(device)[has] > 0.25
+            seg_tp += float((pb & tb).sum())
+            seg_fp += float((pb & ~tb).sum())
+            seg_fn += float((~pb & tb).sum())
+            seg_n += int(has.sum())
         hm = hm_t.float().cpu().numpy() if hm_t is not None else None
         if hm is not None:
             zero_sum += float((hm == 0).mean()) * img.shape[0]
+            if args.hm_relu:                     # 只有保留 ReLU 時才有「整張為 0」的問題
+                dead += (hm.reshape(hm.shape[0], hm.shape[1], -1).max(-1) <= 0).sum(0)
         loss_sum += contact_loss(pred, gt, args.loss).item() * img.shape[0]
         pred_global = pred
         if hm_t is not None and args.decode == "local":
@@ -409,12 +636,19 @@ def evaluate(net, loader, device, args, vis_dir=None):
                     os.makedirs(hdir, exist_ok=True)
                     draw_heatmaps(batch["img_raw"][b].numpy(), hm[b], gt[b].cpu().numpy(),
                                   pred[b].cpu().numpy(), args.kp_beta if args.kp_beta > 0 else 1.0,
-                                  os.path.join(hdir, batch["name"][b]))
+                                  os.path.join(hdir, batch["name"][b]),
+                                  seg=seg_p[b, 0].cpu().numpy() if seg_p is not None else None,
+                                  seg_gt=batch["mask"][b, 0].numpy() if bool(has[b]) else None)
     per = (sum_err / max(n, 1)).tolist()
     per_ord = (sum_err_ord / max(n, 1)).tolist()
     m = {"loss": loss_sum / max(n, 1), "mean_px": float(np.mean(per)), "flip_rate": flips / max(n, 1),
          "mean_px_ordered": float(np.mean(per_ord)), "hm_zero_frac": zero_sum / max(n, 1),
-         "mean_px_softargmax": float((sum_err_global / max(n, 1)).mean())}
+         "mean_px_softargmax": float((sum_err_global / max(n, 1)).mean()),
+         "hm_dead_frac": (dead / max(n, 1)).tolist()}
+    if seg_n:
+        m["seg_iou"] = seg_tp / max(seg_tp + seg_fp + seg_fn, 1)
+        m["seg_precision"] = seg_tp / max(seg_tp + seg_fp, 1)      # 低 = 把背景 / 夾爪當成針
+        m["seg_recall"] = seg_tp / max(seg_tp + seg_fn, 1)         # 低 = 針沒找到
     m.update({f"{k}_px": v for k, v in zip(POINT_NAMES, per)})
     m["by_src"] = {s: {"mean_px": d["sum"] / d["n"], "flip_rate": d["flips"] / d["n"], "n": d["n"]}
                    for s, d in sorted(by_src.items())}
@@ -436,7 +670,7 @@ def select_metric(m, best_on):
     return m["mean_px"]
 
 
-def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224):
+def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224, seg=None, seg_gt=None):
     """每個點一格：裁切圖 + 該點的機率分布 softmax(beta * heatmap)（JET 色階疊在影像上）。
     實心點 = GT、空心圈 = 預測。格子上方標出分布最大機率 pmax 與熵比例（越接近 0 越集中、越接近 1 越平）。
     - 尖峰落在針的正確部位 -> 有學到
@@ -467,6 +701,23 @@ def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224):
                     (220, 220, 220), 1, cv2.LINE_AA)
         tiles.append(np.vstack([head, over]))
         tiles.append(np.full((tile + 34, 4, 3), 40, np.uint8))
+    if seg is not None:
+        # 第 6 格：預測的針 mask（機率，JET）；綠色輪廓 = GT mask
+        v = cv2.resize((np.clip(seg, 0, 1) * 255).astype(np.uint8), (tile, tile), interpolation=cv2.INTER_LINEAR)
+        over = cv2.addWeighted(base, 0.5, cv2.applyColorMap(v, cv2.COLORMAP_JET), 0.5, 0)
+        txt = f"max {seg.max():.2f}"
+        if seg_gt is not None:
+            gb = cv2.resize((seg_gt > 0.25).astype(np.uint8), (tile, tile), interpolation=cv2.INTER_NEAREST)
+            cs, _ = cv2.findContours(gb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(over, cs, -1, (0, 255, 0), 1, cv2.LINE_AA)
+            pb, tb = seg > 0.5, seg_gt > 0.25
+            txt += f"  IoU {(pb & tb).sum() / max((pb | tb).sum(), 1):.2f}"
+        head = np.zeros((34, tile, 3), np.uint8)
+        cv2.putText(head, "needle mask (seg_head)", (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        cv2.putText(head, txt, (6, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+        tiles.append(np.vstack([head, over]))
+        tiles.append(np.full((tile + 34, 4, 3), 40, np.uint8))
     cv2.imwrite(path, np.hstack(tiles[:-1]))
 
 
@@ -488,6 +739,244 @@ def draw(img_rgb, gt, pred, path, scale=3, r=2):
     cv2.putText(img, "filled = GT   ring = pred", (8, S - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (255, 255, 255), 1, cv2.LINE_AA)
     cv2.imwrite(path, img)
+
+
+# -----------------------------------------------------------------------------
+# 特徵圖檢查（backbone / decoder / attention 有沒有學到 5 個點的特徵）
+# -----------------------------------------------------------------------------
+PROBE_LAYERS = ["layer1", "layer2", "layer3", "layer4", "dec1", "dec2", "dec3", "cb2", "attn"]
+
+
+class FeatureProbe:
+    """在官方模組上掛 forward hook 取中間特徵圖（不改模型、平常不啟動）。
+    layer1~4：ResNet18 各 stage 輸出（56/28/14/7）；dec1~3：deconv 後 BN+ReLU（14/28/56）；
+    cb2：cb1、cb2 之後（56）；attn：attention 輸出（56，就是 cb3 的輸入）"""
+
+    def __init__(self, net):
+        self.on, self.feats = False, {}
+        cn = net.r3m.convnet
+        for i in range(1, 5):
+            self._reg(getattr(cn, f"layer{i}"), f"layer{i}")
+        for i in range(1, 4):
+            self._reg(getattr(net, f"bn{i}"), f"dec{i}", F.relu)     # 官方在 bn 之後接 ReLU
+        self._reg(net.cb2, "cb2")
+        self._reg(net.self_attention, "attn", self._attn)
+
+    @staticmethod
+    def _attn(o):
+        o = o[0] if isinstance(o, tuple) else o                      # (B, H*W, C)
+        B, N, C = o.shape
+        s = int(round(math.sqrt(N)))
+        return o.transpose(1, 2).reshape(B, C, s, s)
+
+    def _reg(self, m, name, fn=None):
+        def hook(mod, inp, out):
+            if self.on:
+                t = fn(out) if fn else out
+                self.feats[name] = t.detach().float().clone()        # clone：官方後面有 inplace ReLU
+        m.register_forward_hook(hook)
+
+    @torch.no_grad()
+    def run(self, net, img):
+        self.feats, self.on = {}, True
+        try:
+            net.encode_img(img)
+        finally:
+            self.on = False
+        HM_CACHE.pop("x", None)
+        return {k: self.feats[k] for k in PROBE_LAYERS if k in self.feats}
+
+
+def sample_feat(fn, pts):
+    """fn: (B, C, h, w) 已 L2 normalize；pts: (B, 5, 2) normalized (x, y) -> (B, 5, C) 雙線性取樣後再 normalize"""
+    grid = (pts * 2 - 1).unsqueeze(2)                                    # (B, 5, 1, 2)
+    v = F.grid_sample(fn, grid, mode="bilinear", align_corners=False)[..., 0]   # (B, C, 5)
+    return F.normalize(v.transpose(1, 2), dim=-1)
+
+
+@torch.no_grad()
+def compute_prototypes(net, probe, loader, device, max_n=0):
+    """每層、每個點：train 原圖在 GT 位置的（normalize 後）特徵平均 -> 原型 (5, C)"""
+    net.eval()
+    sums, n = {}, 0
+    for batch in loader:
+        img, gt = batch["img"].to(device), batch["pts"].to(device)
+        for L, f in probe.run(net, img).items():
+            v = sample_feat(F.normalize(f, dim=1), gt).sum(0)
+            sums[L] = sums[L] + v if L in sums else v
+        n += img.shape[0]
+        if max_n and n >= max_n:
+            break
+    return {L: F.normalize(v, dim=-1) for L, v in sums.items()}, n
+
+
+def _overlay(base, m, tile, nearest=True):
+    lo, hi = float(m.min()), float(m.max())
+    v = ((m - lo) / (hi - lo) * 255).astype(np.uint8) if hi - lo > 1e-9 else np.zeros(m.shape, np.uint8)
+    v = cv2.resize(v, (tile, tile), interpolation=cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR)
+    return cv2.addWeighted(base, 0.4, cv2.applyColorMap(v, cv2.COLORMAP_JET), 0.6, 0), lo, hi
+
+
+def draw_feature_grid(img_rgb, gt, side, per_layer, path, tile=128):
+    """列 = 各層；欄 = 原圖 | energy | head | tail | middle | head_1_3 | tail_1_3。
+    熱力圖以「最近鄰」放大，看得到該層真正的解析度（layer4 是 7x7 格）。
+    實心點 = GT；白色 x = 該原型相似度最高的位置；格子上方：cos 範圍 與 argmax 誤差（原圖 px）"""
+    base = cv2.resize(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), (tile, tile), interpolation=cv2.INTER_AREA)
+    P = lambda q: (int(round(q[0] * tile)), int(round(q[1] * tile)))
+    lab_w, head_h, gap = 92, 18, 3
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def cell(im, text, col=(230, 230, 230)):
+        h = np.zeros((head_h, tile, 3), np.uint8)
+        cv2.putText(h, text, (3, 13), font, 0.36, col, 1, cv2.LINE_AA)
+        return np.vstack([h, im])
+
+    titles = ["image", "energy |f|"] + POINT_NAMES
+    hdr = [np.zeros((20, lab_w, 3), np.uint8)]
+    for j, t in enumerate(titles):
+        h = np.zeros((20, tile, 3), np.uint8)
+        col = POINT_COLORS[j - 2] if j >= 2 else (255, 255, 255)
+        cv2.putText(h, t, (4, 14), font, 0.45, col, 1, cv2.LINE_AA)
+        hdr += [np.full((20, gap, 3), 40, np.uint8), h]
+    rows = [np.hstack(hdr)]
+    for L, (energy, sim, am) in per_layer.items():
+        lab = np.zeros((tile + head_h, lab_w, 3), np.uint8)
+        cv2.putText(lab, L, (6, 60), font, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(lab, f"{energy.shape[0]}x{energy.shape[1]}", (6, 82), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+        im0 = base.copy()
+        for g, c in zip(gt, POINT_COLORS):
+            cv2.circle(im0, P(g), 3, c, -1, cv2.LINE_AA)
+        en, lo, hi = _overlay(base, energy, tile)
+        for g, c in zip(gt, POINT_COLORS):
+            cv2.circle(en, P(g), 3, c, -1, cv2.LINE_AA)
+        cells = [cell(im0, ""), cell(en, f"|f| {lo:.1f}~{hi:.1f}")]
+        for k in range(5):
+            ov, lo, hi = _overlay(base, sim[k], tile)
+            cv2.circle(ov, P(gt[k]), 4, POINT_COLORS[k], -1, cv2.LINE_AA)
+            cv2.circle(ov, P(gt[k]), 5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.drawMarker(ov, P(am[k]), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 10, 2)
+            err = float(np.linalg.norm(am[k] - gt[k]) * side)
+            cells.append(cell(ov, f"cos {lo:.2f}~{hi:.2f} err {err:.0f}px"))
+        row = [lab]
+        for c in cells:
+            row += [np.full((tile + head_h, gap, 3), 40, np.uint8), c]
+        rows.append(np.hstack(row))
+        rows.append(np.full((gap, rows[-1].shape[1], 3), 40, np.uint8))
+    cv2.imwrite(path, np.vstack(rows[:-1]))
+
+
+@torch.no_grad()
+def feature_probe(net, probe, protos, loader, device, out_dir=None, n_draw=0):
+    """在 val 上：每層的原型相似度 argmax 誤差、5 點分類、頭尾分類、針上能量比；並畫前 n_draw 張。"""
+    net.eval()
+    acc = {L: {"err": torch.zeros(5), "cls": 0.0, "ht": 0.0, "eratio": 0.0} for L in protos}
+    n, drawn = 0, 0
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    for batch in loader:
+        img, gt = batch["img"].to(device), batch["pts"].to(device)
+        side = batch["crop"][:, 2].to(device)
+        B = img.shape[0]
+        maps = {}
+        for L, f in probe.run(net, img).items():
+            fn = F.normalize(f, dim=1)
+            sim = torch.einsum("bchw,kc->bkhw", fn, protos[L])                       # (B, 5, h, w)
+            _, K, h, w = sim.shape
+            idx = sim.reshape(B, K, -1).argmax(-1)
+            am = torch.stack([((idx % w).float() + 0.5) / w, ((idx // w).float() + 0.5) / h], -1)
+            acc[L]["err"] += ((am - gt).norm(dim=-1) * side[:, None]).sum(0).cpu()
+            s = torch.einsum("bkc,jc->bkj", sample_feat(fn, gt), protos[L])          # GT 位置 k 與原型 j
+            acc[L]["cls"] += float((s.argmax(-1) == torch.arange(5, device=device)).float().sum())
+            acc[L]["ht"] += float((s[:, 0, 0] > s[:, 0, 1]).float().sum() + (s[:, 1, 1] > s[:, 1, 0]).float().sum())
+            energy = f.norm(dim=1)                                                    # (B, h, w)
+            e_pts = F.grid_sample(energy[:, None], (gt * 2 - 1).unsqueeze(2), align_corners=False)[:, 0, :, 0]
+            acc[L]["eratio"] += float((e_pts.mean(1) / energy.mean((1, 2)).clamp_min(1e-8)).sum())
+            if out_dir and drawn < n_draw:
+                maps[L] = (energy.cpu().numpy(), sim.cpu().numpy(), am.cpu().numpy())
+        n += B
+        if out_dir and drawn < n_draw:
+            for b in range(B):
+                if drawn >= n_draw:
+                    break
+                draw_feature_grid(batch["img_raw"][b].numpy(), batch["pts"][b].numpy(), float(side[b]),
+                                  {L: (e[b], sm[b], a[b]) for L, (e, sm, a) in maps.items()},
+                                  os.path.join(out_dir, batch["name"][b]))
+                drawn += 1
+    out = {}
+    for L, d in acc.items():
+        per = (d["err"] / max(n, 1)).tolist()
+        out[L] = {"argmax_err_mean": float(np.mean(per)), **{f"{k}_err": v for k, v in zip(POINT_NAMES, per)},
+                  "proto_acc": d["cls"] / max(5 * n, 1), "head_tail_acc": d["ht"] / max(2 * n, 1),
+                  "energy_ratio": d["eratio"] / max(n, 1)}
+    return out, n
+
+
+def print_feature_table(epoch, res, n_tr, n_val):
+    print(f"[特徵檢查 ep {epoch}] 原型：train 原圖 {n_tr} 根針；val {n_val} 根針"
+          f"（5 點分類隨機 = 20%，頭尾分類隨機 = 50%；能量比 > 1 = 針上的特徵比背景強）")
+    print(f"    {'layer':7s} {'argmax誤差':>10s} {'5點分類':>8s} {'頭尾分類':>8s} {'能量比':>7s}   各點誤差 h/t/m/h13/t13 (px)")
+    for L, r in res.items():
+        print(f"    {L:7s} {r['argmax_err_mean']:8.1f}px {r['proto_acc']:8.0%} {r['head_tail_acc']:8.0%} "
+              f"{r['energy_ratio']:7.2f}   " + " / ".join(f"{r[k + '_err']:.0f}" for k in POINT_NAMES))
+
+
+def plot_feature_curves(run_dir):
+    """feat_log.jsonl -> features.png：x = 層（淺到深），每個檢查過的 epoch 一條線（ep 0 = pretrained，虛線）"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    path = os.path.join(run_dir, "feat_log.jsonl")
+    if not os.path.isfile(path):
+        return None
+    recs = {}
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                recs[r["epoch"]] = r
+    if not recs:
+        return None
+    eps = sorted(recs)
+    layers = [L for L in PROBE_LAYERS if L in recs[eps[0]]["layers"]]
+    x = np.arange(len(layers))
+    ink, muted, grid = "#1f2328", "#59636e", "#e6e8eb"
+    cmap = plt.get_cmap("Blues")
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4.6), dpi=120)
+    specs = [("proto_acc", "5-point classification by prototype", 0.2, True),
+             ("head_tail_acc", "Head vs tail at GT locations", 0.5, True),
+             ("argmax_err_mean", "Prototype-similarity argmax error (px)", None, False)]
+    for ax, (key, title, chance, pct) in zip(axes, specs):
+        ax.set_facecolor("white")
+        ax.grid(True, color=grid, linewidth=0.8)
+        ax.set_axisbelow(True)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.tick_params(colors=muted, labelsize=9)
+        for i, e in enumerate(eps):
+            ys = [recs[e]["layers"][L][key] for L in layers]
+            if e == 0:
+                ax.plot(x, ys, color=muted, linewidth=1.8, linestyle="--", marker="o", markersize=3, label="ep 0 (pretrained)")
+            else:
+                c = cmap(0.35 + 0.65 * (i / max(len(eps) - 1, 1)))
+                ax.plot(x, ys, color=c, linewidth=2 if e == eps[-1] else 1.2, marker="o", markersize=3, label=f"ep {e}")
+        if chance is not None:
+            ax.axhline(chance, color="#d9480f", linewidth=1, linestyle=":", label=f"chance {chance:.0%}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(layers, rotation=30)
+        ax.set_title(title, color=ink, fontsize=11, loc="left")
+        if pct:
+            ax.set_ylim(0, 1.02)
+            ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
+        else:
+            ax.set_ylim(bottom=0)
+        ax.legend(frameon=False, fontsize=8, labelcolor=ink)
+    fig.suptitle(os.path.basename(os.path.normpath(run_dir)) + "  feature probe (val)", color=ink, fontsize=11,
+                 x=0.01, ha="left")
+    fig.tight_layout()
+    out = os.path.join(run_dir, "features.png")
+    fig.savefig(out, facecolor="white")
+    plt.close(fig)
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -762,24 +1251,43 @@ def main(args):
             HM_CACHE["x"] = x
             return _orig(x, other_axis, axis_size)
         _M.get_coord = _capture
-    if resume_state is None:
-        load_pretrained(net, args.pretrained)
+    ckpt_info = load_pretrained(net, args.pretrained) if resume_state is None else None
+    reinit = set()
     if not args.attn_kp_fc:
-        fix_heatmap_head(net, remove_relu=args.hm_relu == 0,
-                         reinit=bool(args.reinit_hm_head) and resume_state is None)
+        do_reinit = bool(args.reinit_hm_head) and resume_state is None
+        fix_heatmap_head(net, remove_relu=args.hm_relu == 0, reinit=do_reinit)
+        if do_reinit:
+            reinit.add("cb3")
+        if args.hm_relu and args.kp_beta <= 0:
+            print("[WARN] cb3 有 ReLU 且使用官方 get_coord：分布接近均勻，5 點會縮到中心；建議 --kp_beta 10")
+    patch_attention(net, args.attn_mode)
+    n_mask = sum(1 for x in train_set.samples if x.get("mask"))
+    use_seg = args.seg_weight > 0 and n_mask > 0
+    if use_seg or (resume_state is not None and any(k.startswith("seg_head.") for k in resume_state["model"])):
+        add_seg_head(net)
+        print(f"    train 有 mask 的圖：{n_mask}/{len(train_set)}（沒有 mask 的圖不計 seg loss）")
+    elif args.seg_weight > 0:
+        print("[NOTE] 資料沒有 mask（請用新版 build_needle5_aug.py 重做），segmentation 輔助頭不啟用")
     net = net.to(device)
 
-    backbone = list(net.r3m.parameters())
-    bids = {id(p) for p in backbone}
-    others = [p for p in net.parameters() if id(p) not in bids]
-    if args.freeze_backbone:
-        for p in backbone:
+    # 凍結：--freeze_upto 指定的 stage（含）之前全部不訓練
+    if args.freeze_backbone and args.freeze_upto == "none":
+        args.freeze_upto = "backbone"
+    frozen = stage_modules(args.freeze_upto)
+    for name in frozen:
+        for p in getattr(net, name).parameters():
             p.requires_grad = False
-        groups = [{"params": others, "lr": args.lr}]
-    else:
-        groups = [{"params": others, "lr": args.lr},
-                  {"params": backbone, "lr": args.lr * args.backbone_lr_mult}]
+    if frozen:
+        print(f"[NOTE] 凍結 {args.freeze_upto} 之前（含）：{frozen}")
+    bids = {id(p) for p in net.r3m.parameters()}
+    backbone = [p for p in net.r3m.parameters() if p.requires_grad]
+    others = [p for p in net.parameters() if p.requires_grad and id(p) not in bids]
+    groups = [{"params": others, "lr": args.lr}]
+    if backbone:
+        groups.append({"params": backbone, "lr": args.lr * args.backbone_lr_mult})
     optim = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+    if ckpt_info is not None:
+        write_init_report(net, run_dir, args, ckpt_info, reinit, set(frozen), find_used_modules(net, device))
     base_lrs = [g["lr"] for g in groups]
     steps_per_epoch = math.ceil(len(train_set) / bs)
     total_steps = args.epochs * steps_per_epoch
@@ -825,10 +1333,23 @@ def main(args):
               + "  ".join(f"{k} {base[k + '_px']:.1f}" for k in POINT_NAMES))
         print("  -> 模型的 val mean 若和這個差不多，代表它只學到「平均形狀」，沒有真的看圖找針")
 
+    probe = FeatureProbe(net) if args.feat_probe and val_loader else None
+
+    def run_probe(ep):
+        protos, n_tr = compute_prototypes(net, probe, train_eval_loader, device, args.feat_proto_n)
+        res, n_val = feature_probe(net, probe, protos, val_loader, device,
+                                   os.path.join(run_dir, "vis", f"epoch{ep:04d}_val", "features"), args.feat_vis_n)
+        with open(os.path.join(run_dir, "feat_log.jsonl"), "a") as f:
+            f.write(json.dumps({"epoch": ep, "n_proto": n_tr, "n_val": n_val, "layers": res}) + "\n")
+        print_feature_table(ep, res, n_tr, n_val)
+        plot_feature_curves(run_dir)
+
     if val_loader and not resumed:
         m = evaluate(net, val_loader, device, args, os.path.join(run_dir, "vis", "epoch0000_val"))
         print("[pretrained] val: " + "  ".join(f"{k}={v:.3f}" for k, v in m.items()
                                                if isinstance(v, (int, float))) + src_msg(m))
+        if probe:
+            run_probe(0)
 
     ckpt_path = os.path.join(run_dir, CKPT_NAME)
     log_f = open(os.path.join(run_dir, "log.jsonl"), "a")
@@ -838,15 +1359,24 @@ def main(args):
             net.train()
             if args.freeze_bn:
                 set_bn_eval(net)
+            for name in frozen:                       # 凍結的模組：BN 統計量、dropout 也固定
+                getattr(net, name).eval()
             t0 = time.time()
-            tot, n = 0.0, 0
+            tot, n, seg_tot = 0.0, 0, 0.0
             for batch in train_loader:
                 set_lr(step)
                 img = batch["img"].to(device)
                 gt = batch["pts"].to(device)
+                HM_CACHE.pop("attn", None)
                 loss = contact_loss(predict_xy(net, img, args), gt, args.loss)
                 if use_hm:
                     loss = loss + args.hm_weight * heatmap_loss(gt, args)
+                if use_seg:
+                    ls = seg_loss(seg_logits(net), batch["mask"].to(device), batch["has_mask"].to(device),
+                                  args.seg_pos_weight, args.seg_dice)
+                    if ls is not None:
+                        loss = loss + args.seg_weight * ls
+                        seg_tot += ls.item() * img.shape[0]
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 if args.grad_clip > 0:
@@ -858,6 +1388,9 @@ def main(args):
 
             rec = {"epoch": epoch, "lr": optim.param_groups[0]["lr"], "train_loss": tot / n}
             msg = f"ep {epoch:4d} | train loss {tot / n:.5f}"
+            if use_seg:
+                rec["train_seg_loss"] = seg_tot / n
+                msg += f" (seg {seg_tot / n:.3f})"
             do_vis = epoch % args.vis_every == 0 or epoch == args.epochs
             if val_loader and (epoch % args.eval_every == 0 or do_vis):
                 vm = evaluate(net, val_loader, device, args,
@@ -868,6 +1401,10 @@ def main(args):
                         f"flip {vm['flip_rate']:.0%}"
                         + (f" hm0 {vm['hm_zero_frac']:.0%} | soft-argmax(全圖) {vm['mean_px_softargmax']:.1f}px"
                            if not args.attn_kp_fc else "")
+                        + (" | dead " + "/".join(f"{d:.0%}" for d in vm["hm_dead_frac"])
+                           if not args.attn_kp_fc and max(vm["hm_dead_frac"]) > 0 else "")
+                        + (f" | seg IoU {vm['seg_iou']:.2f} P {vm['seg_precision']:.2f} R {vm['seg_recall']:.2f}"
+                           if "seg_iou" in vm else "")
                         + src_msg(vm))
                 score = select_metric(vm, args.best_on)
                 if score < best:
@@ -880,6 +1417,8 @@ def main(args):
                 rec["train_eval"] = tm
                 msg += f" | train mean {tm['mean_px']:.1f}px"
             print(msg + f" | {time.time() - t0:.1f}s")
+            if do_vis and probe:
+                run_probe(epoch)
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
             if epoch % args.save_every == 0:
@@ -949,16 +1488,25 @@ if __name__ == "__main__":
     p.add_argument("--coord_dim", type=int, default=64)
     p.add_argument("--resnet_type", type=str, default="resnet18")
     p.add_argument("--attn_kp", type=int, default=1)
-    p.add_argument("--attn_kp_fc", type=int, default=1, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
+    p.add_argument("--attn_kp_fc", type=int, default=0, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
     p.add_argument("--decode", choices=["local", "global"], default="local",
                    help="attn_kp_fc=0 時評估 / 畫圖用的解碼：local = 只看尖峰附近（去掉往中心拉的偏差）；global = 全圖 soft-argmax")
     p.add_argument("--decode_radius", type=int, default=3, help="local 解碼的範圍（熱度圖格數，56x56）")
-    p.add_argument("--hm_relu", type=int, default=0,
-                   help="attn_kp_fc=0 時熱度圖輸出層是否保留官方的 ReLU（0 = 移除，避免 dead ReLU；1 = 官方原版）")
+    p.add_argument("--hm_relu", type=int, default=1,
+                   help="attn_kp_fc=0 時熱度圖輸出層 cb3 是否保留官方的 ReLU（1 = 官方原版，預設；0 = 拿掉）")
+    p.add_argument("--attn_mode", choices=["official", "spatial"], default="official",
+                   help="official：照官方（MultiheadAttention 沒設 batch_first，實際沿 batch 維度做 attention）；"
+                        "spatial：每張影像 H*W 個位置之間做 attention（同一組權重）")
+    p.add_argument("--freeze_upto", choices=["none"] + [s[0] for s in STAGES[:-1]], default="none",
+                   help="凍結到哪一段（含）：backbone / decoder / cb / attn；例如 attn = 只訓練 cb3")
     p.add_argument("--reinit_hm_head", type=int, default=1,
                    help="attn_kp_fc=0 時重新初始化熱度圖輸出層 cb3（官方 pretrained 沒訓練過這層）")
     p.add_argument("--hm_weight", type=float, default=0.1,
                    help="attn_kp_fc=0 且 kp_beta>0 時，高斯 heatmap 監督（KL）的權重；0 = 關閉")
+    p.add_argument("--seg_weight", type=float, default=0.5,
+                   help="segmentation 輔助頭的 loss 權重（資料要有 mask：新版 build_needle5_aug.py）；0 = 不使用")
+    p.add_argument("--seg_pos_weight", type=float, default=5.0, help="BCE 中「針」像素的權重（針只佔很少像素）")
+    p.add_argument("--seg_dice", type=float, default=1.0, help="Dice loss 的權重（相對於 BCE）")
     p.add_argument("--hm_sigma", type=float, default=1.5, help="目標高斯的標準差（heatmap 格數，56x56）")
     p.add_argument("--kp_beta", type=float, default=0,
                    help="attn_kp_fc=0 時的 softmax 溫度倒數；>0 會改用 2D softmax（建議 10~30），0 = 官方原版")
@@ -983,7 +1531,7 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--backbone_lr_mult", type=float, default=0.1)
-    p.add_argument("--freeze_backbone", type=int, default=0)
+    p.add_argument("--freeze_backbone", type=int, default=0, help="舊選項，等同 --freeze_upto backbone")
     p.add_argument("--freeze_bn", type=int, default=1)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--warmup_steps", type=int, default=50)
@@ -996,6 +1544,10 @@ if __name__ == "__main__":
     p.add_argument("--plot_every", type=int, default=5, help="每幾個 epoch 更新一次 curves.png")
     p.add_argument("--plot_only", default=None, metavar="RUN_DIR",
                    help="不訓練，只依 RUN_DIR/log.jsonl 畫 curves.png（訓練中也可以用）")
+    p.add_argument("--feat_probe", type=int, default=1,
+                   help="1 = 在 epoch 0 與每 --vis_every 個 epoch 做特徵圖檢查（features.png、vis/*/features/）")
+    p.add_argument("--feat_vis_n", type=int, default=16, help="特徵檢查每次畫幾張 val 圖")
+    p.add_argument("--feat_proto_n", type=int, default=0, help="算原型最多用幾根 train 原圖的針（0 = 全部）")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
     if a.exp:                         # runs/needle5 -> runs/<exp>/needle5
@@ -1004,6 +1556,9 @@ if __name__ == "__main__":
     if a.plot_only:
         out = plot_curves(a.plot_only)
         print(f"→ {out}" if out else f"[ERROR] {a.plot_only} 裡沒有 log.jsonl")
+        fo = plot_feature_curves(a.plot_only)
+        if fo:
+            print(f"→ {fo}")
         sys.exit(0)
     if not a.resume and not (a.vrb_root and a.ann and a.pretrained):
         p.error("新的訓練需要 --vrb_root、--ann、--pretrained（接續只需要 --resume）")
