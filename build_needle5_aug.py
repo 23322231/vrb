@@ -15,7 +15,7 @@
 
 用法:
     python build_needle5_aug.py \
-        --ann needle5_dataset/annotations.json \
+        --ann needle5_mine/annotations.json \
         --images_root DATA/Images \
         --out_dir needle5_aug --n_aug 10
 

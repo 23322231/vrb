@@ -43,6 +43,15 @@
         --out_dir runs/needle5
 
     python train_vrb_needle5.py --resume latest --out_dir runs/needle5
+
+    # 用 --exp 分類：結果存到 runs/<exp>/needle5_<時間>/（每個 run 內也會存一份當時的程式碼）
+    #   接續時同樣加 --exp：python train_vrb_needle5.py --resume latest --exp mine_plus_senior
+
+    # 多個資料集一起訓練（各自沿用自己的 train/val/test 切分；終端機與 curves.png 會分開顯示各資料集誤差）
+    python train_vrb_needle5.py --vrb_root . \
+        --ann ./needle5_mine_aug/annotations.json ./needle5_aug/annotations.json \
+        --pretrained ./models/model_checkpoint_1249.pth.tar \
+        --attn_kp_fc 0 --kp_beta 10 --loss ordered --balance 1 --best_on needle5_mine_aug
 """
 
 import argparse
@@ -52,6 +61,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 
@@ -165,6 +175,7 @@ class Needle5Dataset(Dataset):
             "pts": torch.from_numpy(pn),                                     # (5, 2) x, y
             "crop": torch.tensor([x0, y0, side], dtype=torch.float32),
             "name": f"{os.path.splitext(os.path.basename(s['image']))[0]}_n{s['needle_id']}.png",
+            "src": s.get("_src", "data"),
         }
 
 
@@ -183,15 +194,19 @@ class Needle5CropDataset(Dataset):
 
     def __getitem__(self, i):
         s = self.samples[i]
-        img = Image.open(os.path.join(self.root, s["image"])).convert("RGB")
+        img = Image.open(os.path.join(s.get("_root", self.root), s["image"])).convert("RGB")
         if img.size != (224, 224):
             img = img.resize((224, 224), Image.BILINEAR)
+        name = os.path.basename(s["image"])
+        if s.get("_multi"):                       # 多個資料集合併時，檔名前加上資料集名稱避免撞名
+            name = f"{s['_src']}__{name}"
         return {
             "img": self.tf(img),
             "img_raw": torch.from_numpy(np.asarray(img).copy()),
             "pts": torch.tensor(s["points"], dtype=torch.float32),
             "crop": torch.tensor([0, 0, s["side_px"]], dtype=torch.float32),   # side_px：誤差換算回原圖 pixel
-            "name": os.path.basename(s["image"]),
+            "name": name,
+            "src": s.get("_src", "data"),
         }
 
 
@@ -346,6 +361,7 @@ def evaluate(net, loader, device, args, vis_dir=None):
     sum_err_global = torch.zeros(5)
     n, loss_sum, flips = 0, 0.0, 0
     zero_sum = 0.0
+    by_src = {}                                  # 每個資料集各自的誤差（多資料集合併訓練時用）
     for batch in loader:
         img = batch["img"].to(device)
         gt = batch["pts"].to(device)
@@ -377,6 +393,12 @@ def evaluate(net, loader, device, args, vis_dir=None):
             err = torch.where(flipped[:, None], err_sw, err)
         sum_err += err.sum(0).cpu()
         n += img.shape[0]
+        e_mean = err.mean(1).cpu().tolist()
+        for b, src in enumerate(batch["src"]):
+            d = by_src.setdefault(src, {"sum": 0.0, "n": 0, "flips": 0})
+            d["sum"] += e_mean[b]
+            d["n"] += 1
+            d["flips"] += int(flipped[b])
         if vis_dir:
             os.makedirs(vis_dir, exist_ok=True)
             for b in range(img.shape[0]):
@@ -394,7 +416,24 @@ def evaluate(net, loader, device, args, vis_dir=None):
          "mean_px_ordered": float(np.mean(per_ord)), "hm_zero_frac": zero_sum / max(n, 1),
          "mean_px_softargmax": float((sum_err_global / max(n, 1)).mean())}
     m.update({f"{k}_px": v for k, v in zip(POINT_NAMES, per)})
+    m["by_src"] = {s: {"mean_px": d["sum"] / d["n"], "flip_rate": d["flips"] / d["n"], "n": d["n"]}
+                   for s, d in sorted(by_src.items())}
     return m
+
+
+def src_msg(m):
+    """多資料集時在終端機印出各資料集的 val mean。"""
+    bs = m.get("by_src", {})
+    if len(bs) < 2:
+        return ""
+    return " | " + "  ".join(f"[{s}] {d['mean_px']:.1f}px flip {d['flip_rate']:.0%}" for s, d in bs.items())
+
+
+def select_metric(m, best_on):
+    """選 best 權重用的數字：預設是全部 val 的 mean；--best_on 指定資料集時只看該資料集。"""
+    if best_on and best_on in m.get("by_src", {}):
+        return m["by_src"][best_on]["mean_px"]
+    return m["mean_px"]
 
 
 def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224):
@@ -481,7 +520,9 @@ def plot_curves(run_dir):
     c_train, c_val = "#2a78d6", "#d9480f"
     pt_colors = ["#d62728", "#1f5bd6", "#2b9348", "#f08c00", "#0fa3b1"]   # 與 vis 圖的點同色系
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), dpi=120)
+    srcs = sorted({s for e in ve for s in recs[e]["val"].get("by_src", {})})
+    multi = len(srcs) > 1
+    fig, axes = plt.subplots(1, 3 if multi else 2, figsize=(19 if multi else 13, 4.6), dpi=120)
     for ax in axes:
         ax.set_facecolor("white")
         ax.grid(True, color=grid, linewidth=0.8)
@@ -537,6 +578,23 @@ def plot_curves(run_dir):
     ax.set_ylim(bottom=0)
     ax.legend(frameon=False, fontsize=8, ncol=2, labelcolor=ink)
 
+    # (3) 多資料集：各資料集的 val mean
+    if multi:
+        ax = axes[2]
+        src_colors = ["#2a78d6", "#d9480f", "#2b9348", "#7048e8", "#c2255c"]
+        for s, c in zip(srcs, src_colors * 3):
+            es = [e for e in ve if s in recs[e]["val"].get("by_src", {})]
+            ys = [recs[e]["val"]["by_src"][s]["mean_px"] for e in es]
+            ax.plot(es, ys, color=c, linewidth=2, label=f"{s} (n={recs[es[-1]]['val']['by_src'][s]['n']})")
+            b = int(np.argmin(ys))
+            ax.scatter([es[b]], [ys[b]], s=36, color=c, edgecolors="white", linewidths=1.5, zorder=3)
+            ax.annotate(f"{ys[b]:.1f}px @ {es[b]}", (es[b], ys[b]), xytext=(6, -14),
+                        textcoords="offset points", fontsize=8, color=c)
+        ax.set_title("Val mean error per dataset" + sym_note, color=ink, fontsize=11, loc="left")
+        ax.set_ylabel("px", color=muted)
+        ax.set_ylim(bottom=0)
+        ax.legend(frameon=False, fontsize=8, labelcolor=ink)
+
     fig.suptitle(os.path.basename(os.path.normpath(run_dir)), color=ink, fontsize=11, x=0.01, ha="left")
     fig.tight_layout()
     out = os.path.join(run_dir, "curves.png")
@@ -587,6 +645,35 @@ def save_checkpoint(path, net, optim, epoch, step, best, args):
 
 
 # -----------------------------------------------------------------------------
+def load_annotations(paths):
+    """讀一個或多個 annotations.json。多個時合併（必須都是 build_needle5_aug.py 的離線格式），
+    每筆記錄自己的影像根目錄（_root）與資料集名稱（_src = annotations.json 所在資料夾名稱）。
+    各資料集沿用自己原本的 train / val / test 切分。"""
+    anns, srcs, dirs = [], [], []
+    for p in paths:
+        with open(p, "r", encoding="utf-8") as f:
+            anns.append(json.load(f))
+        d = os.path.dirname(os.path.abspath(p))
+        name, k = os.path.basename(d), 2
+        while name in srcs:                                     # 資料夾同名時加編號
+            name, k = f"{os.path.basename(d)}_{k}", k + 1
+        srcs.append(name)
+        dirs.append(d)
+    if len(anns) == 1:
+        a = anns[0]
+        for s in a.get("samples", []):
+            s["_src"] = srcs[0]
+        a["_srcs"], a["_dirs"] = srcs, dirs
+        return a
+    if any(a.get("format") != "needle5_crops" for a in anns):
+        sys.exit("[ERROR] 多個 --ann 只支援 build_needle5_aug.py 產生的離線增強資料（format: needle5_crops）")
+    merged = {"format": "needle5_crops", "samples": [], "_srcs": srcs, "_dirs": dirs}
+    for a, s_name, d in zip(anns, srcs, dirs):
+        for s in a["samples"]:
+            merged["samples"].append({**s, "_src": s_name, "_root": d, "_multi": True})
+    return merged
+
+
 def main(args):
     if not torch.cuda.is_available():
         sys.exit("[ERROR] 官方 VRBModel 在 __init__ 內對 BatchNorm 呼叫了 .cuda()，需要 GPU")
@@ -604,18 +691,20 @@ def main(args):
             sys.exit("這個 run 已經訓練完成")
     else:
         run_dir = make_run_dir(args.out_dir)
-        for k in ("vrb_root", "ann", "pretrained"):
+        # 保存這次用的程式碼，之後可以知道每個結果是哪一版程式訓練出來的
+        shutil.copy2(os.path.abspath(__file__), os.path.join(run_dir, "train_vrb_needle5.py"))
+        for k in ("vrb_root", "pretrained"):
             setattr(args, k, os.path.abspath(getattr(args, k)))
+        args.ann = [os.path.abspath(p) for p in args.ann]
         print(f"新的訓練，結果存到：{run_dir}")
 
-    with open(args.ann, "r", encoding="utf-8") as f:
-        ann = json.load(f)
+    ann = load_annotations(args.ann if isinstance(args.ann, list) else [args.ann])
     offline = ann.get("format") == "needle5_crops"
     if args.train_splits is None:
         args.train_splits = ["train"] if offline else ["train", "val"]
     if args.val_splits is None:
         args.val_splits = ["val"] if offline else ["test"]
-    images_root = args.images_root or (os.path.dirname(os.path.abspath(args.ann)) if offline else ann.get("images_root"))
+    images_root = args.images_root or (ann["_dirs"][0] if offline else ann.get("images_root"))
     if not images_root or not os.path.isdir(images_root):
         sys.exit(f"[ERROR] 找不到影像資料夾 {images_root}，請用 --images_root 指定（container 內的路徑）")
     args.images_root = os.path.abspath(images_root)
@@ -635,6 +724,10 @@ def main(args):
         n_orig = sum(not x.get("augmented", False) for x in train_set.samples)
         print(f"[離線增強資料] train {len(train_set)} 張（其中原圖 {n_orig}）({args.train_splits}) / "
               f"val {len(val_set)} 張 ({args.val_splits})；訓練時不再做線上增強")
+        if len(ann["_srcs"]) > 1:
+            for s in ann["_srcs"]:
+                print(f"    [{s}] train {sum(x['_src'] == s for x in train_set.samples)} 張 / "
+                      f"val {sum(x['_src'] == s for x in val_set.samples)} 張")
     else:
         train_set = Needle5Dataset(ann, args.images_root, args.train_splits, args, train=True)
         val_set = Needle5Dataset(ann, args.images_root, args.val_splits, args, train=False)
@@ -643,7 +736,17 @@ def main(args):
     if len(train_set) == 0:
         sys.exit("[ERROR] 沒有訓練資料")
     bs = min(args.batch_size, len(train_set))
-    train_loader = DataLoader(train_set, batch_size=bs, shuffle=True, num_workers=args.num_workers)
+    if args.balance and offline and len(ann["_srcs"]) > 1:
+        # 每個資料集被抽到的機率相同（不然張數多的那份會主導訓練）；每個 epoch 的張數不變
+        cnt = {}
+        for x in train_set.samples:
+            cnt[x["_src"]] = cnt.get(x["_src"], 0) + 1
+        w = torch.tensor([1.0 / cnt[x["_src"]] for x in train_set.samples], dtype=torch.double)
+        sampler = torch.utils.data.WeightedRandomSampler(w, num_samples=len(train_set), replacement=True)
+        train_loader = DataLoader(train_set, batch_size=bs, sampler=sampler, num_workers=args.num_workers)
+        print(f"[balance] 各資料集抽樣機率相同：{cnt}")
+    else:
+        train_loader = DataLoader(train_set, batch_size=bs, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_set, batch_size=bs, shuffle=False, num_workers=0) if len(val_set) else None
     train_eval_loader = DataLoader(train_eval_set, batch_size=bs, shuffle=False, num_workers=0)
 
@@ -724,7 +827,8 @@ def main(args):
 
     if val_loader and not resumed:
         m = evaluate(net, val_loader, device, args, os.path.join(run_dir, "vis", "epoch0000_val"))
-        print("[pretrained] val: " + "  ".join(f"{k}={v:.3f}" for k, v in m.items()))
+        print("[pretrained] val: " + "  ".join(f"{k}={v:.3f}" for k, v in m.items()
+                                               if isinstance(v, (int, float))) + src_msg(m))
 
     ckpt_path = os.path.join(run_dir, CKPT_NAME)
     log_f = open(os.path.join(run_dir, "log.jsonl"), "a")
@@ -763,9 +867,11 @@ def main(args):
                         f"mid {vm['middle_px']:.1f} h1/3 {vm['head_1_3_px']:.1f} t1/3 {vm['tail_1_3_px']:.1f}) "
                         f"flip {vm['flip_rate']:.0%}"
                         + (f" hm0 {vm['hm_zero_frac']:.0%} | soft-argmax(全圖) {vm['mean_px_softargmax']:.1f}px"
-                           if not args.attn_kp_fc else ""))
-                if vm["mean_px"] < best:
-                    best = vm["mean_px"]
+                           if not args.attn_kp_fc else "")
+                        + src_msg(vm))
+                score = select_metric(vm, args.best_on)
+                if score < best:
+                    best = score
                     torch.save(net.state_dict(), os.path.join(run_dir, "model_best.pth.tar"))
                     msg += "  *best*"
             if do_vis:
@@ -793,7 +899,8 @@ def main(args):
 
     torch.save(net.state_dict(), os.path.join(run_dir, "model_last.pth.tar"))
     log_f.close()
-    print(f"完成，best val mean = {best:.1f}px，結果在 {run_dir}（學習曲線：curves.png）")
+    print(f"完成，best val mean{f' [{args.best_on}]' if args.best_on else ''} = {best:.1f}px，"
+          f"結果在 {run_dir}（學習曲線：curves.png）")
 
     # 用 best 權重評估 test（只在 test 沒被拿來訓練 / 選模型時）
     test_splits = [sp for sp in ("test",) if sp not in args.train_splits and sp not in args.val_splits]
@@ -808,16 +915,25 @@ def main(args):
             with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
                 json.dump(tm, f, indent=2)
             print(f"[test, best 權重] {len(test_set)} 張  mean {tm['mean_px']:.1f}px  "
-                  + "  ".join(f"{k} {tm[k + '_px']:.1f}" for k in POINT_NAMES) + f"  flip {tm['flip_rate']:.0%}")
+                  + "  ".join(f"{k} {tm[k + '_px']:.1f}" for k in POINT_NAMES) + f"  flip {tm['flip_rate']:.0%}"
+                  + src_msg(tm))
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--vrb_root")
-    p.add_argument("--ann", help="mask_to_needle5.py 輸出的 annotations.json")
+    p.add_argument("--ann", nargs="+",
+                   help="annotations.json，可以給多個一起訓練（例如自己的 + 學長的，需為 build_needle5_aug.py 格式）")
+    p.add_argument("--balance", type=int, default=0,
+                   help="多個資料集時：1 = 每個資料集抽樣機率相同（張數少的那份不會被淹沒）；0 = 照張數比例")
+    p.add_argument("--best_on", default=None,
+                   help="多個資料集時，只用這個資料集（資料夾名稱，例如 needle5_mine_aug）的 val 選 best 權重；預設用全部 val")
     p.add_argument("--images_root", default=None, help="影像根目錄（預設用 annotations.json 裡的；container 路徑不同時要指定）")
     p.add_argument("--pretrained")
-    p.add_argument("--out_dir", default="runs/needle5", help="實際存到 <out_dir>_<開始時間>/")
+    p.add_argument("--out_dir", default="runs/needle5",
+                   help="實際存到 <out_dir>_<開始時間>/；不指定就是 runs/needle5_<開始時間>/")
+    p.add_argument("--exp", default=None,
+                   help="實驗分類資料夾：結果存到 runs/<exp>/needle5_<開始時間>/，例如 --exp mine_plus_senior")
     p.add_argument("--resume", default=None, help="run 資料夾 / checkpoint_last.pth / latest")
     p.add_argument("--train_splits", nargs="+", default=None,
                    help="預設：離線資料 train；線上資料 train val")
@@ -882,6 +998,9 @@ if __name__ == "__main__":
                    help="不訓練，只依 RUN_DIR/log.jsonl 畫 curves.png（訓練中也可以用）")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
+    if a.exp:                         # runs/needle5 -> runs/<exp>/needle5
+        a.out_dir = os.path.join(os.path.dirname(a.out_dir.rstrip("/")) or ".", a.exp,
+                                 os.path.basename(a.out_dir.rstrip("/")))
     if a.plot_only:
         out = plot_curves(a.plot_only)
         print(f"→ {out}" if out else f"[ERROR] {a.plot_only} 裡沒有 log.jsonl")
