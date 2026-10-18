@@ -253,6 +253,10 @@ def main():
     ap.add_argument("--group_regex", default=r"^(left|right)[_-]?",
                     help="從檔名移除這段後相同的影像視為同一組（預設合併 left_/right_ 立體影像）；'' = 不合併")
     ap.add_argument("--split_file", default=None, help="沿用之前的 split.json（重做增強時切分保持不變）")
+    ap.add_argument("--val_groups", nargs="+", default=None,
+                    help="手動指定當 val 的 clip（資料夾名稱的一部分即可）；有指定時其餘 clip 不再隨機分配")
+    ap.add_argument("--test_groups", nargs="+", default=None,
+                    help="手動指定當 test 的 clip；沒給 = 沒有 test（只有 train / val）")
     ap.add_argument("--n_aug", type=int, default=10, help="train 每根針額外產生幾張增強圖")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vis", choices=["all", "some", "none"], default="some",
@@ -323,7 +327,18 @@ def main():
                     c = min(r_i * a.chunks_per_clip // n, a.chunks_per_clip - 1)
                     keys[rel] = f"{k}#t{c:02d}"
                     chunk_info[rel] = (k, r_i, rels)
-        gsplit = split_groups(keys.values(), a.ratios, a.seed)
+        if a.val_groups or a.test_groups:
+            def pick(k, pats):
+                return any(p in k for p in (pats or []))
+            gsplit = {}
+            for k in set(keys.values()):
+                gsplit[k] = "val" if pick(k, a.val_groups) else ("test" if pick(k, a.test_groups) else "train")
+            for pats, sp in ((a.val_groups, "val"), (a.test_groups, "test")):
+                for p in pats or []:
+                    if not any(p in k for k in gsplit):
+                        raise SystemExit(f"--{sp}_groups '{p}' 對不到任何 clip")
+        else:
+            gsplit = split_groups(keys.values(), a.ratios, a.seed)
         img_split = {rel: gsplit[k] for rel, k in keys.items()}
         if chunk_info and a.chunk_gap > 0:
             # 相鄰區段被分到不同組時，交界附近 chunk_gap 張不使用（避免幾乎一樣的影格跨組）
@@ -338,6 +353,10 @@ def main():
                 src = [x for x in src if x["image"] not in dropped]
                 img_split = {r: v for r, v in img_split.items() if r not in dropped}
         n_groups = len(set(keys.values()))
+        cnt = {}
+        for k in keys.values():
+            cnt[k] = cnt.get(k, 0) + 1
+        print("每組影像數：" + "，".join(f"{k[5:] if k.startswith('clip:') else k} {v}" for k, v in sorted(cnt.items())))
         print(f"切分單位：{'clip（資料夾）' if any(k.startswith('clip:') for k in keys.values()) else '影像'}，共 {n_groups} 組")
         for sp in ("train", "val", "test"):
             gs = sorted({k for k in keys.values() if gsplit[k] == sp})

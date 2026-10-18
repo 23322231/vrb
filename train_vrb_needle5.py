@@ -77,6 +77,15 @@ segmentation 輔助頭（--seg_weight > 0，且資料有 mask 時才啟用；mas
 
     python train_vrb_needle5.py --resume latest --out_dir runs/needle5
 
+    # 照 VRB 論文原版（--paper 1）：attn_kp 0（沒有 attention）、spatial softmax（無溫度）、
+    # 全圖期望值當座標、loss 只有 L_contact、Adam lr 1e-4 cosine；命令列明確給的參數優先
+    python train_vrb_needle5.py --vrb_root . --ann ./needle5_thread_aug/annotations.json \
+        --pretrained ./models/model_checkpoint_1249.pth.tar --paper 1 --exp paper --epochs 150
+
+    # 完全不用 pretrained（整個網路隨機初始化，從零訓練；自動 freeze_bn 0、backbone_lr_mult 1）
+    python train_vrb_needle5.py --vrb_root . --ann ./needle5_thread_aug/annotations.json \
+        --pretrained none --exp scratch --attn_mode spatial --kp_beta 10 --hm_loss mse --lr 1e-3 --epochs 150
+
     # 用 --exp 分類：結果存到 runs/<exp>/needle5_<時間>/（每個 run 內也會存一份當時的程式碼）
     #   接續時同樣加 --exp：python train_vrb_needle5.py --resume latest --exp mine_plus_senior
 
@@ -279,12 +288,39 @@ def build_vrb(args):
 HM_CACHE = {}
 
 
+# --paper 1：VRB 論文（CVPR 2023）Sec 3.2.2 Eq.2 與 Appendix B 的設定
+PAPER_PRESET = {
+    "attn_kp": 0,            # Appendix B：3 層 deconv + 2 個 conv block，channels [256,128,64,10,5]，沒有 attention
+    "attn_kp_fc": 0,         # 熱度圖 + spatial softmax（不是 fc 回歸）
+    "kp_beta": 1.0,          # spatial softmax σ2D，沒有溫度：全部 H×W 位置做 softmax
+    "decode": "global",      # 座標 = 整張圖機率的期望值（評估也一樣）
+    "hm_relu": 1,            # 官方 conv_block 的 BN + ReLU（論文沒提，照程式）
+    "contact_weight": 1.0,   # Eq.2：L_contact = ||μ − σ2D(...)||²（官方 obj_loss 5·mean）
+    "hm_weight": 0.0,        # 論文沒有 heatmap loss
+    "seg_weight": 0.0,       # 論文沒有 segmentation
+    "loss": "ordered",
+    "attn_mode": "official",
+    "lr": 1e-4,              # Appendix B：Adam、lr 1e-4、cosine
+    "weight_decay": 0.0,     # Adam（沒有 weight decay）
+    "warmup_steps": 0,
+    "grad_clip": 0.0,
+    "backbone_lr_mult": 1.0,
+    "freeze_bn": 0,
+}
+
+
+def heatmap_head(net):
+    """輸出 5 張 heatmap 的那一層：attn_kp=1（官方 demo / 釋出的 checkpoint）是 cb3；
+    attn_kp=0（論文 Appendix B：3 層 deconv + 2 個 conv block，channels [256,128,64,10,5]）是 cb2。"""
+    return net.cb3 if hasattr(net, "cb3") else net.cb2
+
+
 def fix_heatmap_head(net, remove_relu=False, reinit=True):
     """attn_kp_fc=0 的熱度圖輸出層 cb3 = Conv1x1 -> BatchNorm -> ReLU（官方原版）。
     - 官方 pretrained 是用 fc 路徑訓練的，cb3 雖然存在 checkpoint 裡，但從來沒有被訓練過（等於隨機值）
     - reinit：重新初始化 cb3（卷積權重 std=0.01 + BatchNorm 統計量歸零），從頭訓練這一層
     - remove_relu：把最後的 ReLU 換成 Identity（--hm_relu 0；預設不拿掉，維持官方架構）"""
-    head = net.cb3
+    head = heatmap_head(net)
     if remove_relu and hasattr(head, "relu"):
         head.relu = nn.Identity()
         print("[NOTE] 已移除熱度圖輸出層 cb3 最後的 ReLU（--hm_relu 0，與官方架構不同）")
@@ -368,17 +404,37 @@ def patch_get_coord(beta):
         return torch.sum(g_c_prob * coord_pt, dim=2), g_c_prob
 
     M.get_coord = get_coord
-    print(f"[NOTE] 已將 networks.model.get_coord 改為 2D softmax（beta={beta}）")
+    if beta == 1:
+        print("[NOTE] 座標 = spatial softmax σ2D（論文 Eq.2）：每張 heatmap 在全部 H×W 個位置上做 softmax，"
+              "再對整張圖的機率取 x / y 期望值（官方程式是先沿一軸平均再做 1D softmax）")
+    else:
+        print(f"[NOTE] 座標 = spatial softmax，溫度 beta={beta}（softmax(beta·heatmap)；論文 / 官方沒有 beta，"
+              f"--kp_beta 1 = 論文原版）")
+
+
+def is_scratch(path):
+    return str(path).lower() in ("none", "scratch", "")
 
 
 def load_pretrained(net, path):
-    """回傳 checkpoint 裡的 key 集合與 missing keys（給 init_report 用）。"""
+    """回傳 checkpoint 裡的 key 集合與 missing keys（給 init_report 用）。
+    path = none：不載入任何權重。官方 VRBModel 的 backbone 是 torchvision resnet18()（沒有 weights=），
+    所以整個網路（含 backbone）都是 PyTorch 預設的隨機初始化 = 完全從零訓練。"""
+    if is_scratch(path):
+        print("不載入 pretrained（--pretrained none）：整個網路從隨機初始化開始訓練（backbone 也沒有 ImageNet / R3M 權重）")
+        return {"keys": set(), "missing": set(), "path": "none（完全從零訓練）"}
     dt = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(dt, dict) and "state_dict" in dt and isinstance(dt["state_dict"], dict):
         dt = dt["state_dict"]
     dt = {k[7:] if k.startswith("module.") else k: v for k, v in dt.items()}
+    # 形狀不同的層不載入（例如 --attn_kp 0 的論文版 cb1 / cb2 是 64→10→5，官方 checkpoint 是 64→64→64）
+    own = net.state_dict()
+    skipped = [k for k, v in dt.items() if k in own and own[k].shape != v.shape]
+    dt = {k: v for k, v in dt.items() if k not in skipped}
     missing, unexpected = net.load_state_dict(dt, strict=False)
     print(f"載入 pretrained: {path}")
+    if skipped:
+        print(f"  形狀不同、不載入（維持隨機初始化）: {len(skipped)} {skipped[:10]}")
     print(f"  missing keys   : {len(missing)} {missing[:10]}")
     print(f"  unexpected keys: {len(unexpected)} {unexpected[:10]}")
     return {"keys": set(dt.keys()), "missing": set(missing), "path": path}
@@ -442,9 +498,11 @@ def write_init_report(net, run_dir, args, ckpt_info, reinit, frozen, used):
             src = "官方 pretrained"
         elif not keys:
             src = "（無參數）"
+        elif is_scratch(args.pretrained):
+            src = "隨機初始化（--pretrained none）"
         else:
             src = "隨機初始化（checkpoint 沒有）"
-        if name == "cb3" and in_ckpt:
+        if name == "cb3" and in_ckpt and not is_scratch(args.pretrained):
             src += "；checkpoint 有此層，但官方訓練走 fc 路徑，從未被訓練"
         is_used = name in used or name == "seg_head"
         trained = is_used and name not in frozen and n_p > 0 and any(p.requires_grad for p in mod.parameters())
@@ -470,19 +528,32 @@ def write_init_report(net, run_dir, args, ckpt_info, reinit, frozen, used):
          f"- pretrained：`{ckpt_info['path']}`",
          f"- attn_kp={args.attn_kp}, attn_kp_fc={args.attn_kp_fc}, n_maps=5（建構參數與官方 demo.py 相同）",
          f"- freeze_upto={args.freeze_upto}, freeze_bn={args.freeze_bn}（1 = 所有 BatchNorm 用 pretrained 統計量，不更新）",
+         f"- 學習率：lr={args.lr:g}，backbone ×{args.backbone_lr_mult:g}",
          "", "| stage | 模組 | 參數量 | 初始化 | forward 有用到 | 訓練 |", "|---|---|---:|---|---|---|"]
     for r in rows:
         L.append(f"| {r[0]} | `{r[1]}` | {r[2]:,} | {r[3]} | {r[4]} | {r[5]} |")
     L += ["", "## 與官方程式不同的地方", ""]
     if not args.attn_kp_fc:
-        L.append(f"- 座標解碼 get_coord："
-                 + (f"改為 2D softmax(β·heatmap) 的邊際分布，β={args.kp_beta}（官方：先沿一軸平均再 softmax）"
-                    if args.kp_beta > 0 else "官方原版"))
+        if args.kp_beta == 1:
+            L.append("- 座標解碼 get_coord：spatial softmax σ2D（論文 Eq.2 / Appendix B），全部 H×W 位置做 softmax，"
+                     "對整張圖取期望值；官方程式的 get_coord 是「先沿一軸平均再 1D softmax」，與論文描述不同，這裡照論文")
+        else:
+            L.append(f"- 座標解碼 get_coord："
+                     + (f"spatial softmax 加溫度 β={args.kp_beta}（softmax(β·heatmap)；論文沒有 β）"
+                        if args.kp_beta > 0 else "官方程式原版（先沿一軸平均再 1D softmax）"))
+        L.append(f"- 熱度圖分支：{'官方程式 attn_kp=1：cb1、cb2(64ch) → attention → cb3(64→5)' if args.attn_kp else '論文 Appendix B（attn_kp=0）：3 層 deconv + cb1(64→10) + cb2(10→5)，沒有 attention'}")
         L.append(f"- cb3 最後的 ReLU：{'保留（官方原版）' if args.hm_relu else '拿掉（Identity）'}")
         if args.kp_beta > 0 and args.hm_weight > 0:
-            L.append(f"- 額外 loss：高斯 heatmap KL，權重 {args.hm_weight}，σ={args.hm_sigma} 格（56x56）")
+            L.append(f"- heatmap loss：{'逐像素 MSE，目標 = 峰值 1 的高斯（Wang et al. 2025 作法）' if args.hm_loss == 'mse' else '高斯 heatmap KL'}"
+                     f"，權重 {args.hm_weight}，σ={args.hm_sigma} 格（56x56）")
+        L.append(f"- 座標 loss（官方 obj_loss）權重：{args.contact_weight}"
+                 + ("（= 0：只用 heatmap 訓練，座標只在評估時從 heatmap 尖峰解出）" if args.contact_weight == 0 else ""))
         L.append(f"- 評估解碼：{'local（argmax 附近 ±%d 格加權平均）' % args.decode_radius if args.decode == 'local' else '全圖 soft-argmax'}")
-    L.append(f"- attention：{'官方原版（沿 batch 維度）' if args.attn_mode == 'official' else '空間 attention（每張影像 H*W 個位置之間）'}")
+    if args.attn_kp:
+        L.append(f"- attention：{'官方原版（沿 batch 維度）' if args.attn_mode == 'official' else '空間 attention（每張影像 H*W 個位置之間）'}")
+    if getattr(args, "paper", 0):
+        L.append("- --paper 1：loss 只有論文 Eq.2 的 L_contact（官方 obj_loss 5·mean((μ−gt)²)），沒有 heatmap / seg loss；"
+                 "Adam（weight decay 0）、cosine 學習率、不 warmup、不 gradient clipping、BN 照常更新、backbone 與其他層同一學習率")
     if hasattr(net, "seg_head"):
         L.append(f"- 新增 segmentation 輔助頭 seg_head（attention 輸出 → Conv1x1 → 56x56 針 mask），"
                  f"loss = {args.seg_weight}×(BCE(pos_weight={args.seg_pos_weight}) + {args.seg_dice}×Dice)；"
@@ -508,12 +579,15 @@ def predict_xy(net, img, args):
     return mu
 
 
-def local_decode(hm_logits, beta, radius):
+def local_decode(hm_logits, beta, radius, mode="softmax"):
     """熱度圖解碼：先找機率最大的格子，只用它周圍 (2r+1)x(2r+1) 範圍的機率做加權平均。
     全圖 soft-argmax 會被分散在整張圖的小機率拉向中心；只看尖峰附近可以去掉這個偏差。
     hm_logits: (B, C, H, W) tensor -> (B, C, 2) normalized (x, y)"""
     B, C, Hh, Ww = hm_logits.shape
-    p = torch.softmax(beta * hm_logits.float().reshape(B, C, -1), dim=-1).reshape(B, C, Hh, Ww)
+    if mode == "mse":                                       # 直接回歸高斯：heatmap 數值本身就是權重（負值當 0）
+        p = hm_logits.float().clamp_min(0) + 1e-12
+    else:
+        p = torch.softmax(beta * hm_logits.float().reshape(B, C, -1), dim=-1).reshape(B, C, Hh, Ww)
     idx = p.reshape(B, C, -1).argmax(-1)
     iy, ix = (idx // Ww).view(B, C, 1, 1), (idx % Ww).view(B, C, 1, 1)
     yy = torch.arange(Hh, device=p.device).view(1, 1, Hh, 1)
@@ -546,9 +620,15 @@ def heatmap_loss(gt, args):
         t = t / t.sum(-1, keepdim=True).clamp_min(1e-12)
         return (t * (torch.log(t.clamp_min(1e-12)) - logp)).sum(-1).mean(-1)   # (B,)
 
-    per = kl(gt)
+    def mse(g):
+        """Wang et al. 2025 / 一般 pose estimation 的作法：heatmap 直接回歸「峰值 = 1」的高斯，逐像素 MSE。"""
+        t = torch.exp(-((xs - g[..., 0, None, None]) ** 2 + (ys - g[..., 1, None, None]) ** 2) / (2 * sig ** 2))
+        return ((x.float() - t) ** 2).mean(dim=(2, 3)).mean(-1) * args.hm_mse_scale    # (B,)
+
+    f = mse if args.hm_loss == "mse" else kl
+    per = f(gt)
     if args.loss == "sym":
-        per = torch.minimum(per, kl(gt[:, SWAP_HEAD_TAIL]))
+        per = torch.minimum(per, f(gt[:, SWAP_HEAD_TAIL]))
     return per.mean()
 
 
@@ -601,7 +681,8 @@ def evaluate(net, loader, device, args, vis_dir=None):
         loss_sum += contact_loss(pred, gt, args.loss).item() * img.shape[0]
         pred_global = pred
         if hm_t is not None and args.decode == "local":
-            pred = local_decode(hm_t, args.kp_beta if args.kp_beta > 0 else 1.0, args.decode_radius)
+            pred = local_decode(hm_t, args.kp_beta if args.kp_beta > 0 else 1.0, args.decode_radius,
+                                "mse" if args.hm_loss == "mse" else "softmax")
         # 全圖 soft-argmax 的誤差另外記錄，方便比較兩種解碼
         e_g = (pred_global - gt).norm(dim=-1)
         e_gs = (pred_global - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1)
@@ -955,7 +1036,7 @@ def plot_feature_curves(run_dir):
         for i, e in enumerate(eps):
             ys = [recs[e]["layers"][L][key] for L in layers]
             if e == 0:
-                ax.plot(x, ys, color=muted, linewidth=1.8, linestyle="--", marker="o", markersize=3, label="ep 0 (pretrained)")
+                ax.plot(x, ys, color=muted, linewidth=1.8, linestyle="--", marker="o", markersize=3, label="ep 0 (init)")
             else:
                 c = cmap(0.35 + 0.65 * (i / max(len(eps) - 1, 1)))
                 ax.plot(x, ys, color=c, linewidth=2 if e == eps[-1] else 1.2, marker="o", markersize=3, label=f"ep {e}")
@@ -1183,7 +1264,21 @@ def main(args):
         # 保存這次用的程式碼，之後可以知道每個結果是哪一版程式訓練出來的
         shutil.copy2(os.path.abspath(__file__), os.path.join(run_dir, "train_vrb_needle5.py"))
         for k in ("vrb_root", "pretrained"):
-            setattr(args, k, os.path.abspath(getattr(args, k)))
+            if not (k == "pretrained" and is_scratch(args.pretrained)):
+                setattr(args, k, os.path.abspath(getattr(args, k)))
+        if is_scratch(args.pretrained):
+            # 從零訓練時，pretrained 用的設定不能沿用：
+            #   freeze_bn=1 會讓 BatchNorm 一直用初始統計量（mean 0 / var 1），等於沒有 BN -> 必須關掉
+            #   backbone_lr_mult=0.1 是「保護 pretrained 特徵」用的；隨機的 backbone 要用正常學習率
+            #   freeze_upto 會把隨機層凍住 -> 不允許
+            if args.freeze_bn:
+                print("[NOTE] --pretrained none：freeze_bn 改成 0（BatchNorm 要從資料學統計量）")
+                args.freeze_bn = 0
+            if args.backbone_lr_mult != 1.0:
+                print(f"[NOTE] --pretrained none：backbone_lr_mult {args.backbone_lr_mult:g} -> 1（backbone 是隨機的，不需要保護）")
+                args.backbone_lr_mult = 1.0
+            if args.freeze_upto != "none" or args.freeze_backbone:
+                sys.exit("[ERROR] --pretrained none 不能搭配 --freeze_upto / --freeze_backbone（會凍住隨機權重）")
         args.ann = [os.path.abspath(p) for p in args.ann]
         print(f"新的訓練，結果存到：{run_dir}")
 
@@ -1254,15 +1349,23 @@ def main(args):
     ckpt_info = load_pretrained(net, args.pretrained) if resume_state is None else None
     reinit = set()
     if not args.attn_kp_fc:
-        do_reinit = bool(args.reinit_hm_head) and resume_state is None
+        # cb3 只在 attn_kp=1 時存在，且官方 checkpoint 裡的 cb3 沒被訓練過 -> 重新初始化；
+        # attn_kp=0（論文版）的輸出層是 cb2，形狀和 checkpoint 不同，本來就是隨機初始化，不需要再處理
+        do_reinit = bool(args.reinit_hm_head) and resume_state is None and args.attn_kp
         fix_heatmap_head(net, remove_relu=args.hm_relu == 0, reinit=do_reinit)
         if do_reinit:
             reinit.add("cb3")
         if args.hm_relu and args.kp_beta <= 0:
-            print("[WARN] cb3 有 ReLU 且使用官方 get_coord：分布接近均勻，5 點會縮到中心；建議 --kp_beta 10")
-    patch_attention(net, args.attn_mode)
+            print("[WARN] 輸出層有 ReLU 且使用官方 get_coord：分布接近均勻，5 點會縮到中心；建議 --kp_beta 1（論文 spatial softmax）")
+    if args.attn_kp:
+        patch_attention(net, args.attn_mode)
+    else:
+        print("[NOTE] --attn_kp 0（論文版）：熱度圖分支沒有 attention，cb1(64→10) → cb2(10→5) 直接輸出 5 張 heatmap")
     n_mask = sum(1 for x in train_set.samples if x.get("mask"))
     use_seg = args.seg_weight > 0 and n_mask > 0
+    if use_seg and not args.attn_kp:
+        print("[NOTE] --attn_kp 0 沒有 attention 輸出，segmentation 輔助頭不啟用")
+        use_seg = False
     if use_seg or (resume_state is not None and any(k.startswith("seg_head.") for k in resume_state["model"])):
         add_seg_head(net)
         print(f"    train 有 mask 的圖：{n_mask}/{len(train_set)}（沒有 mask 的圖不計 seg loss）")
@@ -1313,7 +1416,11 @@ def main(args):
         del resume_state
     use_hm = (not args.attn_kp_fc) and args.kp_beta > 0 and args.hm_weight > 0
     if use_hm:
-        print(f"[NOTE] 加上 heatmap 監督：weight={args.hm_weight}, sigma={args.hm_sigma} 格（56x56 heatmap）")
+        print(f"[NOTE] heatmap 監督：{'MSE（峰值 1 的高斯，Wang 2025 作法）' if args.hm_loss == 'mse' else 'KL'}，"
+              f"weight={args.hm_weight}, sigma={args.hm_sigma} 格（56x56；1 格 = 224 裁切圖的 4px）；"
+              f"座標 loss 權重 contact_weight={args.contact_weight}")
+    if args.contact_weight == 0 and not use_hm:
+        sys.exit("[ERROR] contact_weight=0 又沒有 heatmap loss：沒有任何 5 點監督（請加 --kp_beta 10 --hm_weight > 0）")
 
     # 平均位置 baseline：每個點都預測「訓練集該點的平均位置」，模型至少要比這個好
     if val_loader and not resumed:
@@ -1346,7 +1453,7 @@ def main(args):
 
     if val_loader and not resumed:
         m = evaluate(net, val_loader, device, args, os.path.join(run_dir, "vis", "epoch0000_val"))
-        print("[pretrained] val: " + "  ".join(f"{k}={v:.3f}" for k, v in m.items()
+        print(("[隨機初始化]" if is_scratch(args.pretrained) else "[pretrained]") + " val: " + "  ".join(f"{k}={v:.3f}" for k, v in m.items()
                                                if isinstance(v, (int, float))) + src_msg(m))
         if probe:
             run_probe(0)
@@ -1368,7 +1475,7 @@ def main(args):
                 img = batch["img"].to(device)
                 gt = batch["pts"].to(device)
                 HM_CACHE.pop("attn", None)
-                loss = contact_loss(predict_xy(net, img, args), gt, args.loss)
+                loss = args.contact_weight * contact_loss(predict_xy(net, img, args), gt, args.loss)
                 if use_hm:
                     loss = loss + args.hm_weight * heatmap_loss(gt, args)
                 if use_seg:
@@ -1468,7 +1575,9 @@ if __name__ == "__main__":
     p.add_argument("--best_on", default=None,
                    help="多個資料集時，只用這個資料集（資料夾名稱，例如 needle5_mine_aug）的 val 選 best 權重；預設用全部 val")
     p.add_argument("--images_root", default=None, help="影像根目錄（預設用 annotations.json 裡的；container 路徑不同時要指定）")
-    p.add_argument("--pretrained")
+    p.add_argument("--pretrained",
+                   help="官方 checkpoint 路徑；none = 完全不用 pretrained（整個網路隨機初始化、從零訓練；"
+                        "自動 freeze_bn 0、backbone_lr_mult 1）")
     p.add_argument("--out_dir", default="runs/needle5",
                    help="實際存到 <out_dir>_<開始時間>/；不指定就是 runs/needle5_<開始時間>/")
     p.add_argument("--exp", default=None,
@@ -1488,7 +1597,7 @@ if __name__ == "__main__":
     p.add_argument("--coord_dim", type=int, default=64)
     p.add_argument("--resnet_type", type=str, default="resnet18")
     p.add_argument("--attn_kp", type=int, default=1)
-    p.add_argument("--attn_kp_fc", type=int, default=0, help="1: 全連接回歸（官方預設）；0: heatmap + soft-argmax")
+    p.add_argument("--attn_kp_fc", type=int, default=0, help="0: heatmap + soft-argmax（本專案預設）；1: 全連接回歸（官方 demo 預設）")
     p.add_argument("--decode", choices=["local", "global"], default="local",
                    help="attn_kp_fc=0 時評估 / 畫圖用的解碼：local = 只看尖峰附近（去掉往中心拉的偏差）；global = 全圖 soft-argmax")
     p.add_argument("--decode_radius", type=int, default=3, help="local 解碼的範圍（熱度圖格數，56x56）")
@@ -1508,6 +1617,12 @@ if __name__ == "__main__":
     p.add_argument("--seg_pos_weight", type=float, default=5.0, help="BCE 中「針」像素的權重（針只佔很少像素）")
     p.add_argument("--seg_dice", type=float, default=1.0, help="Dice loss 的權重（相對於 BCE）")
     p.add_argument("--hm_sigma", type=float, default=1.5, help="目標高斯的標準差（heatmap 格數，56x56）")
+    p.add_argument("--hm_loss", choices=["kl", "mse"], default="kl",
+                   help="kl：softmax(β·heatmap) 對高斯分布的 KL；mse：heatmap 直接回歸峰值 1 的高斯（Wang 2025 / pose estimation 常用）")
+    p.add_argument("--hm_mse_scale", type=float, default=1000.0,
+                   help="mse 模式的 loss 放大倍數（逐像素 MSE 數值很小，放大後才和其他 loss 同一量級）")
+    p.add_argument("--contact_weight", type=float, default=1.0,
+                   help="官方座標 loss 的權重；0 = 只用 heatmap loss 訓練")
     p.add_argument("--kp_beta", type=float, default=0,
                    help="attn_kp_fc=0 時的 softmax 溫度倒數；>0 會改用 2D softmax（建議 10~30），0 = 官方原版")
     p.add_argument("--traj_len", type=int, default=5)
@@ -1549,7 +1664,20 @@ if __name__ == "__main__":
     p.add_argument("--feat_vis_n", type=int, default=16, help="特徵檢查每次畫幾張 val 圖")
     p.add_argument("--feat_proto_n", type=int, default=0, help="算原型最多用幾根 train 原圖的針（0 = 全部）")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--paper", type=int, default=0,
+                   help="1 = 回到 VRB 論文的設定（見 PAPER_PRESET）；命令列上明確給的參數優先")
     a = p.parse_args()
+    if a.paper and not a.resume:
+        given = lambda k: any(s == f"--{k}" or s.startswith(f"--{k}=") for s in sys.argv[1:])
+        changed = []
+        for k, v in PAPER_PRESET.items():
+            if not given(k) and getattr(a, k) != v:
+                changed.append(f"{k} {getattr(a, k)} -> {v}")
+                setattr(a, k, v)
+        print("[--paper 1] 依 VRB 論文設定：" + ("；".join(changed) if changed else "（已全部一致）"))
+        kept = [k for k in PAPER_PRESET if given(k) and getattr(a, k) != PAPER_PRESET[k]]
+        if kept:
+            print(f"  [NOTE] 這些參數你在命令列有指定，保留你的值（與論文不同）：{kept}")
     if a.exp:                         # runs/needle5 -> runs/<exp>/needle5
         a.out_dir = os.path.join(os.path.dirname(a.out_dir.rstrip("/")) or ".", a.exp,
                                  os.path.basename(a.out_dir.rstrip("/")))
