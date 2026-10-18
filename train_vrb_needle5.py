@@ -116,9 +116,30 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-POINT_NAMES = ["head", "tail", "middle", "head_1_3", "tail_1_3"]
-SWAP_HEAD_TAIL = [1, 0, 2, 4, 3]                 # 頭尾互換後的對應順序
-POINT_COLORS = [(0, 0, 255), (255, 0, 0), (0, 200, 0), (0, 140, 255), (255, 255, 0)]  # BGR
+ALL_POINT_NAMES = ["head", "tail", "middle", "head_1_3", "tail_1_3"]   # 標註檔（annotations.json）裡的 5 點順序
+ALL_SWAP = [1, 0, 2, 4, 3]
+ALL_COLORS = [(0, 0, 255), (255, 0, 0), (0, 200, 0), (0, 140, 255), (255, 255, 0)]  # BGR
+ALL_HEX = ["#d62728", "#1f5bd6", "#2b9348", "#f08c00", "#0fa3b1"]
+# 實際訓練的點：--points 5 = 全部；--points 3 = head / tail / middle（同東京大學 Wang et al. 2025 的針尖 / 針尾 / 中點）
+# 前 3 個點的順序與 5 點相同，所以 0 = head、1 = tail 的邏輯（頭尾互換、頭尾分類）不用改
+POINT_NAMES = list(ALL_POINT_NAMES)
+SWAP_HEAD_TAIL = list(ALL_SWAP)                  # 頭尾互換後的對應順序
+POINT_COLORS = list(ALL_COLORS)
+POINT_SEL = list(range(5))                       # 從標註的 5 點中取哪幾個
+
+
+def configure_points(n):
+    global POINT_NAMES, SWAP_HEAD_TAIL, POINT_COLORS, POINT_SEL
+    if n not in (3, 5):
+        raise SystemExit("--points 只支援 3 或 5")
+    POINT_SEL = list(range(n))
+    POINT_NAMES = ALL_POINT_NAMES[:n]
+    SWAP_HEAD_TAIL = ALL_SWAP[:n]
+    POINT_COLORS = ALL_COLORS[:n]
+
+
+def NP():
+    return len(POINT_NAMES)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 CKPT_NAME = "checkpoint_last.pth"
@@ -216,7 +237,7 @@ class Needle5Dataset(Dataset):
         return {
             "img": self.tf(crop),
             "img_raw": torch.from_numpy(np.asarray(crop).copy()),
-            "pts": torch.from_numpy(pn),                                     # (5, 2) x, y
+            "pts": torch.from_numpy(pn[POINT_SEL]),                          # (NP, 2) x, y
             "crop": torch.tensor([x0, y0, side], dtype=torch.float32),
             "name": f"{os.path.splitext(os.path.basename(s['image']))[0]}_n{s['needle_id']}.png",
             "src": s.get("_src", "data"),
@@ -256,7 +277,7 @@ class Needle5CropDataset(Dataset):
         return {
             "img": self.tf(img),
             "img_raw": torch.from_numpy(np.asarray(img).copy()),
-            "pts": torch.tensor(s["points"], dtype=torch.float32),
+            "pts": torch.tensor(s["points"], dtype=torch.float32)[POINT_SEL],
             "crop": torch.tensor([0, 0, s["side_px"]], dtype=torch.float32),   # side_px：誤差換算回原圖 pixel
             "name": name,
             "src": s.get("_src", "data"),
@@ -282,7 +303,7 @@ def build_vrb(args):
                     num_frames_input=10, resnet_type=args.resnet_type,
                     embed_dim=args.cond_dim, coord_dim=args.coord_dim,
                     num_heads=args.num_heads, enc_depth=args.enc_depth,
-                    attn_kp=args.attn_kp, attn_kp_fc=args.attn_kp_fc, n_maps=5)
+                    attn_kp=args.attn_kp, attn_kp_fc=args.attn_kp_fc, n_maps=NP())
 
 
 HM_CACHE = {}
@@ -313,6 +334,20 @@ def heatmap_head(net):
     """輸出 5 張 heatmap 的那一層：attn_kp=1（官方 demo / 釋出的 checkpoint）是 cb3；
     attn_kp=0（論文 Appendix B：3 層 deconv + 2 個 conv block，channels [256,128,64,10,5]）是 cb2。"""
     return net.cb3 if hasattr(net, "cb3") else net.cb2
+
+
+def set_output_maps(net, n):
+    """官方程式把 heatmap 數量寫死成 5（cb2 = conv_block(10, 5) / cb3 = conv_block(64, 5)；n_maps 只影響 fc 路徑）。
+    --points 3 時用官方同一個 conv_block 函式，把輸出層換成 n 個 channel（輸入、kernel、BN、ReLU 都相同，只差輸出數）。"""
+    import networks.model as M
+    head = heatmap_head(net)
+    if head.conv.out_channels == n:
+        return False
+    new = M.conv_block(head.conv.in_channels, n, kernel_size=head.conv.kernel_size[0], stride=1)
+    setattr(net, "cb3" if hasattr(net, "cb3") else "cb2", new)
+    print(f"[NOTE] 熱度圖輸出層改成 {n} 張（{', '.join(POINT_NAMES)}）：官方 conv_block({head.conv.in_channels}, {n})，"
+          f"其餘與官方相同")
+    return True
 
 
 def fix_heatmap_head(net, remove_relu=False, reinit=True):
@@ -367,8 +402,14 @@ def add_seg_head(net):
         B, N, C = o.shape
         s_ = int(round(math.sqrt(N)))
         HM_CACHE["attn"] = o.transpose(1, 2).reshape(B, C, s_, s_)
-    net.self_attention.register_forward_hook(hook)
-    print("[NOTE] 加上 segmentation 輔助頭 seg_head：attention 輸出 -> Conv1x1(64→1) -> 56x56 針 mask")
+    if hasattr(net, "cb3"):
+        net.self_attention.register_forward_hook(hook)
+        print("[NOTE] 加上 segmentation 輔助頭 seg_head：attention 輸出 -> Conv1x1(64→1) -> 56x56 針 mask")
+    else:
+        # attn_kp=0（論文版）沒有 attention：接在最後一層 deconv 輸出（bn3 之後的 ReLU，56x56x64），
+        # 也就是 cb1 / cb2 的輸入 -> keypoint 與 segmentation 共用同一份特徵
+        net.bn3.register_forward_hook(lambda m, i, o: HM_CACHE.__setitem__("attn", F.relu(o)))
+        print("[NOTE] 加上 segmentation 輔助頭 seg_head：deconv 輸出（dec3，56x56x64）-> Conv1x1(64→1) -> 56x56 針 mask")
 
 
 def seg_logits(net):
@@ -526,7 +567,7 @@ def write_init_report(net, run_dir, args, ckpt_info, reinit, frozen, used):
 
     L = ["# 模型初始化 / 訓練範圍報告", "",
          f"- pretrained：`{ckpt_info['path']}`",
-         f"- attn_kp={args.attn_kp}, attn_kp_fc={args.attn_kp_fc}, n_maps=5（建構參數與官方 demo.py 相同）",
+         f"- attn_kp={args.attn_kp}, attn_kp_fc={args.attn_kp_fc}, n_maps={NP()}（{', '.join(POINT_NAMES)}）",
          f"- freeze_upto={args.freeze_upto}, freeze_bn={args.freeze_bn}（1 = 所有 BatchNorm 用 pretrained 統計量，不更新）",
          f"- 學習率：lr={args.lr:g}，backbone ×{args.backbone_lr_mult:g}",
          "", "| stage | 模組 | 參數量 | 初始化 | forward 有用到 | 訓練 |", "|---|---|---:|---|---|---|"]
@@ -647,14 +688,14 @@ def contact_loss(pred, gt, mode):
 @torch.no_grad()
 def evaluate(net, loader, device, args, vis_dir=None):
     net.eval()
-    sum_err = torch.zeros(5)
-    sum_err_ord = torch.zeros(5)
-    sum_err_global = torch.zeros(5)
+    sum_err = torch.zeros(NP())
+    sum_err_ord = torch.zeros(NP())
+    sum_err_global = torch.zeros(NP())
     n, loss_sum, flips = 0, 0.0, 0
     zero_sum = 0.0
     seg_tp = seg_fp = seg_fn = 0.0
     seg_n = 0
-    dead = np.zeros(5)                           # 每個點：整張 heatmap <= 0 的樣本數（ReLU 全死 -> 分布均勻 -> 點落在中心）
+    dead = np.zeros(NP())                           # 每個點：整張 heatmap <= 0 的樣本數（ReLU 全死 -> 分布均勻 -> 點落在中心）
     by_src = {}                                  # 每個資料集各自的誤差（多資料集合併訓練時用）
     for batch in loader:
         img = batch["img"].to(device)
@@ -931,7 +972,7 @@ def draw_feature_grid(img_rgb, gt, side, per_layer, path, tile=128):
         for g, c in zip(gt, POINT_COLORS):
             cv2.circle(en, P(g), 3, c, -1, cv2.LINE_AA)
         cells = [cell(im0, ""), cell(en, f"|f| {lo:.1f}~{hi:.1f}")]
-        for k in range(5):
+        for k in range(NP()):
             ov, lo, hi = _overlay(base, sim[k], tile)
             cv2.circle(ov, P(gt[k]), 4, POINT_COLORS[k], -1, cv2.LINE_AA)
             cv2.circle(ov, P(gt[k]), 5, (255, 255, 255), 1, cv2.LINE_AA)
@@ -950,7 +991,7 @@ def draw_feature_grid(img_rgb, gt, side, per_layer, path, tile=128):
 def feature_probe(net, probe, protos, loader, device, out_dir=None, n_draw=0):
     """在 val 上：每層的原型相似度 argmax 誤差、5 點分類、頭尾分類、針上能量比；並畫前 n_draw 張。"""
     net.eval()
-    acc = {L: {"err": torch.zeros(5), "cls": 0.0, "ht": 0.0, "eratio": 0.0} for L in protos}
+    acc = {L: {"err": torch.zeros(NP()), "cls": 0.0, "ht": 0.0, "eratio": 0.0} for L in protos}
     n, drawn = 0, 0
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -967,7 +1008,7 @@ def feature_probe(net, probe, protos, loader, device, out_dir=None, n_draw=0):
             am = torch.stack([((idx % w).float() + 0.5) / w, ((idx // w).float() + 0.5) / h], -1)
             acc[L]["err"] += ((am - gt).norm(dim=-1) * side[:, None]).sum(0).cpu()
             s = torch.einsum("bkc,jc->bkj", sample_feat(fn, gt), protos[L])          # GT 位置 k 與原型 j
-            acc[L]["cls"] += float((s.argmax(-1) == torch.arange(5, device=device)).float().sum())
+            acc[L]["cls"] += float((s.argmax(-1) == torch.arange(NP(), device=device)).float().sum())
             acc[L]["ht"] += float((s[:, 0, 0] > s[:, 0, 1]).float().sum() + (s[:, 1, 1] > s[:, 1, 0]).float().sum())
             energy = f.norm(dim=1)                                                    # (B, h, w)
             e_pts = F.grid_sample(energy[:, None], (gt * 2 - 1).unsqueeze(2), align_corners=False)[:, 0, :, 0]
@@ -994,8 +1035,9 @@ def feature_probe(net, probe, protos, loader, device, out_dir=None, n_draw=0):
 
 def print_feature_table(epoch, res, n_tr, n_val):
     print(f"[特徵檢查 ep {epoch}] 原型：train 原圖 {n_tr} 根針；val {n_val} 根針"
-          f"（5 點分類隨機 = 20%，頭尾分類隨機 = 50%；能量比 > 1 = 針上的特徵比背景強）")
-    print(f"    {'layer':7s} {'argmax誤差':>10s} {'5點分類':>8s} {'頭尾分類':>8s} {'能量比':>7s}   各點誤差 h/t/m/h13/t13 (px)")
+          f"（{NP()} 點分類隨機 = {100 // NP()}%，頭尾分類隨機 = 50%；能量比 > 1 = 針上的特徵比背景強）")
+    print(f"    {'layer':7s} {'argmax誤差':>10s} {f'{NP()}點分類':>8s} {'頭尾分類':>8s} {'能量比':>7s}   各點誤差 "
+          + "/".join(POINT_NAMES) + " (px)")
     for L, r in res.items():
         print(f"    {L:7s} {r['argmax_err_mean']:8.1f}px {r['proto_acc']:8.0%} {r['head_tail_acc']:8.0%} "
               f"{r['energy_ratio']:7.2f}   " + " / ".join(f"{r[k + '_err']:.0f}" for k in POINT_NAMES))
@@ -1088,7 +1130,7 @@ def plot_curves(run_dir):
 
     ink, muted, grid = "#1f2328", "#59636e", "#e6e8eb"
     c_train, c_val = "#2a78d6", "#d9480f"
-    pt_colors = ["#d62728", "#1f5bd6", "#2b9348", "#f08c00", "#0fa3b1"]   # 與 vis 圖的點同色系
+    pt_colors = ALL_HEX[:NP()]                                         # 與 vis 圖的點同色系
 
     srcs = sorted({s for e in ve for s in recs[e]["val"].get("by_src", {})})
     multi = len(srcs) > 1
@@ -1253,6 +1295,8 @@ def main(args):
     if args.resume:
         run_dir, ckpt_path = resolve_resume(args.resume, args.out_dir)
         resume_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if "points" not in resume_state["args"]:
+            args.points = 5                          # 舊版 run 都是 5 點
         for k, v in resume_state["args"].items():
             if k != "resume":
                 setattr(args, k, v)
@@ -1282,6 +1326,10 @@ def main(args):
         args.ann = [os.path.abspath(p) for p in args.ann]
         print(f"新的訓練，結果存到：{run_dir}")
 
+    if not hasattr(args, "points") or args.points is None:
+        args.points = 5
+    configure_points(args.points)
+    print(f"[NOTE] 預測 {NP()} 個點：{', '.join(POINT_NAMES)}")
     ann = load_annotations(args.ann if isinstance(args.ann, list) else [args.ann])
     offline = ann.get("format") == "needle5_crops"
     if args.train_splits is None:
@@ -1335,6 +1383,8 @@ def main(args):
     train_eval_loader = DataLoader(train_eval_set, batch_size=bs, shuffle=False, num_workers=0)
 
     net = build_vrb(args)
+    if not args.attn_kp_fc:
+        set_output_maps(net, NP())
     if not args.attn_kp_fc and args.kp_beta > 0:
         patch_get_coord(args.kp_beta)
     elif not args.attn_kp_fc:
@@ -1363,9 +1413,6 @@ def main(args):
         print("[NOTE] --attn_kp 0（論文版）：熱度圖分支沒有 attention，cb1(64→10) → cb2(10→5) 直接輸出 5 張 heatmap")
     n_mask = sum(1 for x in train_set.samples if x.get("mask"))
     use_seg = args.seg_weight > 0 and n_mask > 0
-    if use_seg and not args.attn_kp:
-        print("[NOTE] --attn_kp 0 沒有 attention 輸出，segmentation 輔助頭不啟用")
-        use_seg = False
     if use_seg or (resume_state is not None and any(k.startswith("seg_head.") for k in resume_state["model"])):
         add_seg_head(net)
         print(f"    train 有 mask 的圖：{n_mask}/{len(train_set)}（沒有 mask 的圖不計 seg loss）")
@@ -1503,8 +1550,8 @@ def main(args):
                 vm = evaluate(net, val_loader, device, args,
                               os.path.join(run_dir, "vis", f"epoch{epoch:04d}_val") if do_vis else None)
                 rec["val"] = vm
-                msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else ''} {vm['mean_px']:.1f}px (head {vm['head_px']:.1f} tail {vm['tail_px']:.1f} "
-                        f"mid {vm['middle_px']:.1f} h1/3 {vm['head_1_3_px']:.1f} t1/3 {vm['tail_1_3_px']:.1f}) "
+                msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else ''} {vm['mean_px']:.1f}px ("
+                        + " ".join(f"{k} {vm[k + '_px']:.1f}" for k in POINT_NAMES) + ") "
                         f"flip {vm['flip_rate']:.0%}"
                         + (f" hm0 {vm['hm_zero_frac']:.0%} | soft-argmax(全圖) {vm['mean_px_softargmax']:.1f}px"
                            if not args.attn_kp_fc else "")
@@ -1664,6 +1711,8 @@ if __name__ == "__main__":
     p.add_argument("--feat_vis_n", type=int, default=16, help="特徵檢查每次畫幾張 val 圖")
     p.add_argument("--feat_proto_n", type=int, default=0, help="算原型最多用幾根 train 原圖的針（0 = 全部）")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--points", type=int, choices=[3, 5], default=3,
+                   help="預測幾個點：3 = head / tail / middle（同 Wang et al. 2025）；5 = 再加 head_1_3 / tail_1_3")
     p.add_argument("--paper", type=int, default=0,
                    help="1 = 回到 VRB 論文的設定（見 PAPER_PRESET）；命令列上明確給的參數優先")
     a = p.parse_args()
