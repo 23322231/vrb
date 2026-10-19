@@ -49,7 +49,13 @@ segmentation 輔助頭（--seg_weight > 0，且資料有 mask 時才啟用；mas
         argmax_err_px  相似度最高處與 GT 的距離（原圖 pixel）
         proto_acc      在 GT 5 個位置，特徵最像哪個原型（5 選 1，隨機 = 20%）
         head_tail_acc  在針頭 / 針尾位置，分不分得出頭和尾（2 選 1，隨機 = 50%）
-    - 圖：vis/epochXXXX_val/features/*.png（列 = 9 層；欄 = 原圖、energy、5 個點的相似度）
+    - （原本的逐張相似度圖已改成下面的注意力圖）
+
+注意力圖（--cam 1，預設開啟；epoch 0 與每 --vis_every 個 epoch）：vis/epochXXXX_val/attention/*.png
+    Grad-CAM：目標 = 第 k 張輸出 heatmap 在預測位置的值；某層的注意力 = ReLU(Σ_c 平均梯度_c × 特徵_c)
+    -> 越紅 = 模型預測第 k 個點時越依賴的區域。列 = 各層 + 最後一列「output」（模型輸出的機率分布）；
+       欄 = 各個點；實心點 = GT、白色 x = 預測。格子上方：注意力在針上的比例（有 seg mask 時）、注意力峰值離 GT 的距離
+    數字存在 cam_log.jsonl，終端機也會印出
 - 裁切：以針的框為中心的正方形，邊長 = 框長邊 + 2*pad（pad = max(box_pad, box_pad_ratio*長邊)），
         再縮成 224x224。訓練時加隨機縮放 / 位移 / 翻轉 / 旋轉（--rot_deg）
 - 每次訓練存到 <out_dir>_<開始時間>/，可用 --resume 接續
@@ -1033,6 +1039,207 @@ def feature_probe(net, probe, protos, loader, device, out_dir=None, n_draw=0):
     return out, n
 
 
+# -----------------------------------------------------------------------------
+# 注意力圖（Grad-CAM）：模型「預測某個點時」看影像的哪裡
+# -----------------------------------------------------------------------------
+class GradCam:
+    """Grad-CAM（Selvaraju et al., ICCV 2017）用在 keypoint heatmap 上：
+    目標分數 s_k = 第 k 張輸出 heatmap 在「模型預測位置（尖峰）」的值。
+    對某一層的特徵 A（C×h×w）：權重 α_c = 平均(∂s_k/∂A_c)，注意力 = ReLU(Σ_c α_c·A_c)。
+    -> 越紅 = 這個位置的特徵越會「提高模型對第 k 個點的信心」，也就是模型預測這個點時在看的地方。
+    只掛 forward hook 取特徵，不改模型；只有畫圖時才啟動。"""
+
+    def __init__(self, net):
+        self.on, self.acts = False, {}
+        cn = net.r3m.convnet
+        self.layers = [f"layer{i}" for i in range(1, 5)] + ["dec1", "dec2", "dec3", "cb1"]
+        for i in range(1, 5):
+            self._reg(getattr(cn, f"layer{i}"), f"layer{i}")
+        for i in range(1, 4):
+            self._reg(getattr(net, f"bn{i}"), f"dec{i}")        # 官方接著做 inplace ReLU -> 取到的就是 ReLU 後的特徵
+        self._reg(net.cb1, "cb1")
+        if hasattr(net, "cb3"):                                 # attn_kp=1：cb2 與 attention 是中間層（輸出層是 cb3）
+            self._reg(net.cb2, "cb2")
+            self._reg(net.self_attention, "attn")
+            self.layers += ["cb2", "attn"]
+        # attn_kp=0（論文版）：cb2 就是輸出層，不畫（對自己取 Grad-CAM 只會得到 heatmap 本身）
+
+    def _reg(self, m, name):
+        def hook(mod, inp, out):
+            if self.on:
+                self.acts[name] = out[0] if isinstance(out, tuple) else out
+        m.register_forward_hook(hook)
+
+    @staticmethod
+    def _as_map(t):
+        if t.dim() == 3:                                        # attention 輸出 (B, H*W, C)
+            B, N, C = t.shape
+            s = int(round(math.sqrt(N)))
+            return t.transpose(1, 2).reshape(B, C, s, s)
+        return t
+
+    def run(self, net, img, args):
+        """回傳 cams {layer: (B, K, h, w) 0~1}、heatmap (B, K, H, W)、預測點 (B, K, 2)"""
+        net.eval()
+        self.acts, self.on = {}, True
+        HM_CACHE.pop("x", None)
+        try:
+            with torch.enable_grad():
+                img = img.clone().requires_grad_(True)          # 凍結的層也要有梯度路徑
+                mu = predict_xy(net, img, args)
+                x = HM_CACHE.get("x")
+                if x is None:
+                    return None
+                B, K, H, W = x.shape
+                idx = x.detach().reshape(B, K, -1).argmax(-1)
+                names = [L for L in self.layers if L in self.acts]
+                acts = [self.acts[L] for L in names]
+                cams = {L: [] for L in names}
+                for k in range(K):
+                    score = x[:, k].reshape(B, -1).gather(1, idx[:, k:k + 1]).sum()
+                    grads = torch.autograd.grad(score, acts, retain_graph=k < K - 1, allow_unused=True)
+                    for L, a, g in zip(names, acts, grads):
+                        a, g = self._as_map(a.detach().float()), self._as_map(g.float()) if g is not None else None
+                        if g is None:
+                            cams[L].append(torch.zeros_like(a[:, 0]))
+                            continue
+                        w = g.mean(dim=(2, 3), keepdim=True)
+                        c = F.relu((w * a).sum(1))
+                        cams[L].append(c / c.reshape(B, -1).max(-1)[0].clamp_min(1e-12)[:, None, None])
+        finally:
+            self.on, self.acts = False, {}
+        cams = {L: torch.stack(v, 1).cpu() for L, v in cams.items()}
+        xd = x.detach().float()
+        pred = mu.detach()
+        if args.decode == "local":
+            pred = local_decode(xd, args.kp_beta if args.kp_beta > 0 else 1.0, args.decode_radius,
+                                "mse" if args.hm_loss == "mse" else "softmax")      # 與 evaluate() 相同
+        if args.hm_loss == "mse" and args.hm_weight > 0:
+            prob = xd.clamp_min(0)
+            prob = prob / prob.reshape(B, K, -1).sum(-1).clamp_min(1e-12)[..., None, None]
+        else:
+            beta = args.kp_beta if args.kp_beta > 0 else 1.0
+            prob = torch.softmax(beta * xd.reshape(B, K, -1), -1).reshape(B, K, H, W)
+        return cams, prob.cpu(), pred.cpu()
+
+
+def cam_stats(cam, gt, mask, side):
+    """cam (K, h, w)、gt (K, 2) normalized、mask (56, 56) 0~1 或 None -> 每點 (在針上的比例, 注意力峰值離 GT px)"""
+    K, h, w = cam.shape
+    out = []
+    for k in range(K):
+        c = cam[k].numpy()
+        iy, ix = np.unravel_index(int(c.argmax()), c.shape)
+        peak = np.array([(ix + 0.5) / w, (iy + 0.5) / h])
+        err = float(np.linalg.norm(peak - gt[k]) * side)
+        on = float("nan")
+        if mask is not None and c.sum() > 0:
+            # float 再縮小：低解析度（7x7）時，格子裡只要有一點針就算針上（uint8 縮小會把細針平均成 0）
+            m = cv2.resize((mask > 0).astype(np.float32), (w, h), interpolation=cv2.INTER_AREA if w < mask.shape[1]
+                           else cv2.INTER_NEAREST) > 0
+            m = m.astype(np.uint8)
+            if w >= 28:                                          # 高解析度時放寬 1 格（針很細，注意力常落在邊緣）
+                m = cv2.dilate(m, np.ones((3, 3), np.uint8))
+            on = float((c * m).sum() / c.sum())
+        out.append((on, err))
+    return out
+
+
+def draw_cam_grid(img_rgb, gt, pred, side, cams, prob, path, tile=128):
+    """列 = 各層的 Grad-CAM（最後一列 = 模型輸出的機率分布）；欄 = 原圖 | 各個點。
+    實心點 = GT；白色 x = 模型預測的位置。格子上方：注意力在針上的比例（有 mask 時）與注意力峰值離 GT 的距離。"""
+    base = cv2.resize(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), (tile, tile), interpolation=cv2.INTER_AREA)
+    P = lambda q: (int(round(q[0] * tile)), int(round(q[1] * tile)))
+    lab_w, head_h, gap = 92, 18, 3
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def cell(im, text):
+        h = np.zeros((head_h, tile, 3), np.uint8)
+        cv2.putText(h, text, (3, 13), font, 0.36, (230, 230, 230), 1, cv2.LINE_AA)
+        return np.vstack([h, im])
+
+    def heat(m):
+        v = (np.clip(m, 0, 1) * 255).astype(np.uint8)
+        v = cv2.resize(v, (tile, tile), interpolation=cv2.INTER_LINEAR)
+        return cv2.addWeighted(base, 0.45, cv2.applyColorMap(v, cv2.COLORMAP_JET), 0.55, 0)
+
+    def mark(im, k):
+        cv2.circle(im, P(gt[k]), 4, POINT_COLORS[k], -1, cv2.LINE_AA)
+        cv2.circle(im, P(gt[k]), 5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.drawMarker(im, P(pred[k]), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 10, 2)
+        return im
+
+    hdr = [np.zeros((20, lab_w, 3), np.uint8)]
+    for j, t in enumerate(["image"] + POINT_NAMES):
+        h = np.zeros((20, tile, 3), np.uint8)
+        cv2.putText(h, t, (4, 14), font, 0.45, POINT_COLORS[j - 1] if j else (255, 255, 255), 1, cv2.LINE_AA)
+        hdr += [np.full((20, gap, 3), 40, np.uint8), h]
+    rows = [np.hstack(hdr)]
+    im0 = base.copy()
+    for g, c in zip(gt, POINT_COLORS):
+        cv2.circle(im0, P(g), 3, c, -1, cv2.LINE_AA)
+    entries = [(L, f"{c.shape[1]}x{c.shape[2]}", c, st) for L, (c, st) in cams.items()]
+    entries.append(("output", "prob", prob, None))
+    for L, res, maps, st in entries:
+        lab = np.zeros((tile + head_h, lab_w, 3), np.uint8)
+        cv2.putText(lab, L, (6, 60), font, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(lab, res, (6, 82), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+        cells = [cell(im0.copy(), "")]
+        for k in range(maps.shape[0]):
+            m = maps[k] / max(float(maps[k].max()), 1e-12) if L == "output" else maps[k]
+            if L == "output":
+                txt = f"pred err {float(np.linalg.norm(pred[k] - gt[k]) * side):.0f}px"
+            else:
+                on, err = st[k]
+                txt = (f"on needle {on:.0%}  " if on == on else "") + f"peak {err:.0f}px"
+            cells.append(cell(mark(heat(m), k), txt))
+        row = [lab]
+        for c in cells:
+            row += [np.full((tile + head_h, gap, 3), 40, np.uint8), c]
+        rows.append(np.hstack(row))
+        rows.append(np.full((gap, rows[-1].shape[1], 3), 40, np.uint8))
+    cv2.imwrite(path, np.vstack(rows[:-1]))
+
+
+def attention_maps(net, cam, loader, device, args, out_dir, n_draw):
+    """val 前 n_draw 張：畫 Grad-CAM 圖，並統計每層「注意力在針上的比例」與「注意力峰值離 GT 的距離」"""
+    os.makedirs(out_dir, exist_ok=True)
+    acc, drawn = {}, 0
+    for batch in loader:
+        if drawn >= n_draw:
+            break
+        r = cam.run(net, batch["img"].to(device), args)
+        if r is None:
+            print("[NOTE] 沒有 heatmap 輸出（attn_kp_fc=1），不畫注意力圖")
+            return None
+        cams, prob, pred = r
+        for b in range(batch["img"].shape[0]):
+            if drawn >= n_draw:
+                break
+            gt = batch["pts"][b].numpy()
+            side = float(batch["crop"][b, 2])
+            mask = batch["mask"][b, 0].numpy() if float(batch["has_mask"][b]) > 0 else None
+            per = {}
+            for L, c in cams.items():
+                st = cam_stats(c[b], gt, mask, side)
+                per[L] = (c[b].numpy(), st)
+                a = acc.setdefault(L, {"on": [], "err": []})
+                a["on"] += [s[0] for s in st if s[0] == s[0]]
+                a["err"] += [s[1] for s in st]
+            draw_cam_grid(batch["img_raw"][b].numpy(), gt, pred[b].numpy(), side, per, prob[b].numpy(),
+                          os.path.join(out_dir, batch["name"][b]))
+            drawn += 1
+    res = {L: {"on_needle": float(np.mean(a["on"])) if a["on"] else None, "peak_err_px": float(np.mean(a["err"]))}
+           for L, a in acc.items()}
+    print(f"[注意力圖 Grad-CAM] val {drawn} 張 -> {out_dir}")
+    print("    layer    注意力在針上   注意力峰值離 GT")
+    for L, r in res.items():
+        on = f"{r['on_needle']:.0%}" if r["on_needle"] is not None else "  -"
+        print(f"    {L:7s}  {on:>10s}   {r['peak_err_px']:8.1f}px")
+    return res
+
+
+
 def print_feature_table(epoch, res, n_tr, n_val):
     print(f"[特徵檢查 ep {epoch}] 原型：train 原圖 {n_tr} 根針；val {n_val} 根針"
           f"（{NP()} 點分類隨機 = {100 // NP()}%，頭尾分類隨機 = 50%；能量比 > 1 = 針上的特徵比背景強）")
@@ -1488,11 +1695,18 @@ def main(args):
         print("  -> 模型的 val mean 若和這個差不多，代表它只學到「平均形狀」，沒有真的看圖找針")
 
     probe = FeatureProbe(net) if args.feat_probe and val_loader else None
+    cam = GradCam(net) if args.cam and val_loader and not args.attn_kp_fc else None
+
+    def run_cam(ep):
+        r = attention_maps(net, cam, val_loader, device, args,
+                           os.path.join(run_dir, "vis", f"epoch{ep:04d}_val", "attention"), args.feat_vis_n)
+        if r is not None:
+            with open(os.path.join(run_dir, "cam_log.jsonl"), "a") as f:
+                f.write(json.dumps({"epoch": ep, "layers": r}) + "\n")
 
     def run_probe(ep):
         protos, n_tr = compute_prototypes(net, probe, train_eval_loader, device, args.feat_proto_n)
-        res, n_val = feature_probe(net, probe, protos, val_loader, device,
-                                   os.path.join(run_dir, "vis", f"epoch{ep:04d}_val", "features"), args.feat_vis_n)
+        res, n_val = feature_probe(net, probe, protos, val_loader, device)          # 只算數字（features.png）
         with open(os.path.join(run_dir, "feat_log.jsonl"), "a") as f:
             f.write(json.dumps({"epoch": ep, "n_proto": n_tr, "n_val": n_val, "layers": res}) + "\n")
         print_feature_table(ep, res, n_tr, n_val)
@@ -1504,6 +1718,8 @@ def main(args):
                                                if isinstance(v, (int, float))) + src_msg(m))
         if probe:
             run_probe(0)
+        if cam:
+            run_cam(0)
 
     ckpt_path = os.path.join(run_dir, CKPT_NAME)
     log_f = open(os.path.join(run_dir, "log.jsonl"), "a")
@@ -1573,6 +1789,8 @@ def main(args):
             print(msg + f" | {time.time() - t0:.1f}s")
             if do_vis and probe:
                 run_probe(epoch)
+            if do_vis and cam:
+                run_cam(epoch)
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
             if epoch % args.save_every == 0:
@@ -1708,7 +1926,9 @@ if __name__ == "__main__":
                    help="不訓練，只依 RUN_DIR/log.jsonl 畫 curves.png（訓練中也可以用）")
     p.add_argument("--feat_probe", type=int, default=1,
                    help="1 = 在 epoch 0 與每 --vis_every 個 epoch 做特徵圖檢查（features.png、vis/*/features/）")
-    p.add_argument("--feat_vis_n", type=int, default=16, help="特徵檢查每次畫幾張 val 圖")
+    p.add_argument("--feat_vis_n", type=int, default=16, help="注意力圖（Grad-CAM）每次畫幾張 val 圖")
+    p.add_argument("--cam", type=int, default=1,
+                   help="1 = 在 epoch 0 與每 --vis_every 個 epoch 畫注意力圖（Grad-CAM）：vis/epochXXXX_val/attention/")
     p.add_argument("--feat_proto_n", type=int, default=0, help="算原型最多用幾根 train 原圖的針（0 = 全部）")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--points", type=int, choices=[3, 5], default=3,
