@@ -20,7 +20,9 @@
     3. 左側選 Thread，點線（從針尾接出來的那一段即可），再按 Track
     4. 用 d 往後翻；看到第一張追錯的影格，就在那張用點 / 畫筆 / 橡皮擦修好，再按 Track
        -> 從這張往後重新追蹤，前面已經修好的都保留。重複到 clip 結尾即可
-       （被重新追蹤的物件：這張之後的舊結果、手動修改、提示點會被新結果取代；u 可以復原）
+       （被重新追蹤的物件：這張之後「SAM 追蹤出來」的舊結果會被取代；u 可以復原）
+       「Keep labeled frames (t)」預設開啟：這張之後已經標好的影格（YOLO / Labels 讀回的 mask、手動畫過 / 擦過、
+       下過 SAM 提示的）不會被覆蓋，還會當成 SAM 2 的參考影格；關掉 = 這張之後全部覆蓋
     5. Save（s）；q 存檔並離開
 
 手動修改（畫筆 / 橡皮擦）存在獨立的一層：最終 mask = (SAM 2 結果 ∪ 畫筆) − 橡皮擦。
@@ -164,6 +166,8 @@ class Session:
         self.obj_cls = {}
         self.rebuilt = False
         self.need_reset = False
+        self.trusted = {}           # f -> {oid}：已確認的 mask（YOLO / Labels 讀回、或你標過的），Track 不覆蓋
+        self.protect = True         # Track 時保護已標好的影格
 
     # ---- 物件 ----
     def new_obj(self, cls):
@@ -262,6 +266,8 @@ class Session:
             return [], None
         seeds = {o: self.final(t, o) for o in oids}
         sel = set(oids)
+        # 已標好的影格（保護）：不覆蓋，而且當成 SAM 2 的額外條件影格（追蹤時會參考這些正確的 mask）
+        prot = {(f, o) for f in range(t + 1, self.n) for o in oids if self.is_labeled(f, o)} if self.protect else set()
 
         # undo 快照：t 之後、這些物件的所有內容
         snap = {"kind": "track", "t": t, "oids": oids,
@@ -270,13 +276,18 @@ class Session:
                 "erase": {f: {o: m for o, m in d.items() if o in sel} for f, d in self.erase.items() if f > t},
                 "prompts": {name: {o: {f: v for f, v in src.get(o, {}).items() if f > t} for o in oids}
                             for name, src in (("points", self.points), ("boxes", self.boxes),
-                                              ("mask_prompts", self.mask_prompts))}}
+                                              ("mask_prompts", self.mask_prompts))},
+                "trusted": {f: set(v) for f, v in self.trusted.items()}}
 
         self.reset()                                            # 只用影格 t 的 mask 當條件，其他影格的提示不參與
         new, done = {}, 0
         with self._ctx():
             for o in oids:
                 self.pred.add_new_mask(self.state, frame_idx=t, obj_id=o, mask=seeds[o])
+            for f, o in sorted(prot):
+                m = self.final(f, o)
+                if m.any():
+                    self.pred.add_new_mask(self.state, frame_idx=f, obj_id=o, mask=m)
             for f, ids, logits in self.pred.propagate_in_video(self.state, start_frame_idx=t, reverse=False):
                 if f > t:
                     new[f] = {int(o): (lg[0] > 0.0).cpu().numpy() for o, lg in zip(ids, logits)}
@@ -285,25 +296,37 @@ class Session:
                     on_progress(done)
         self.need_reset = True                                  # 之後點擊前先清掉追蹤記憶
 
-        for f in range(t + 1, self.n):                          # 寫回：只動 t 之後、被追蹤的物件
+        for f in range(t + 1, self.n):                          # 寫回：只動 t 之後、被追蹤、沒被保護的物件
             d = self.sam.setdefault(f, {})
             for o in oids:
+                if (f, o) in prot:
+                    continue
                 m = new.get(f, {}).get(o)
                 if m is None:
                     d.pop(o, None)
                 else:
                     d[o] = m
-            for layer in (self.add, self.erase):
-                for o in oids:
+                for layer in (self.add, self.erase):
                     layer.get(f, {}).pop(o, None)
-        for src in (self.points, self.boxes, self.mask_prompts):
-            for o in oids:
-                for f in [f for f in src.get(o, {}) if f > t]:
-                    src[o].pop(f)
+                for src in (self.points, self.boxes, self.mask_prompts):
+                    src.get(o, {}).pop(f, None)
+                self.trusted.get(f, set()).discard(o)
+        snap["n_protected"] = len(prot)
         return oids, snap
+
+    def is_labeled(self, f, o):
+        """這張影格的這個物件是否「已標好」：YOLO / Labels 讀回的 mask、手動畫過 / 擦過、或下過 SAM 提示。"""
+        if o in self.trusted.get(f, ()) and self.final(f, o).any():
+            return True
+        a, e = self.add.get(f, {}).get(o), self.erase.get(f, {}).get(o)
+        if (a is not None and a.any()) or (e is not None and e.any()):
+            return True
+        return bool(self.points.get(o, {}).get(f) or self.boxes.get(o, {}).get(f) is not None
+                    or self.mask_prompts.get(o, {}).get(f) is not None)
 
     def restore_track(self, s):
         t, oids = s["t"], set(s["oids"])
+        self.trusted = {f: set(v) for f, v in s.get("trusted", {}).items()}
         for f in [f for f in self.sam if f > t]:
             for o in oids:
                 self.sam[f].pop(o, None)
@@ -599,14 +622,23 @@ class App:
             oids, snap = sess.propagate_from(t, only, lambda n: print(f"  propagated {n} frames", end="\r"))
             if snap is not None:
                 self.push(snap)
+                npf = snap.get("n_protected", 0)
                 st["msg"] = (f"tracked {len(oids)} {what} object(s) from frame {t + 1} in {time.time() - t0:.0f}s"
-                             f" - frames 1..{t + 1} unchanged; u = undo")
+                             f" - frames 1..{t + 1} unchanged"
+                             + (f"; {npf} labeled frame(s) after it kept" if sess.protect else
+                                "; protect OFF: later frames overwritten") + "; u = undo")
             else:
                 st["msg"] = f"no {what} mask on this frame: label it here first, then Track"
         except RuntimeError as e:
             sess.need_reset = True
             st["msg"] = f"tracking failed: {str(e)[:80]}"
         print()
+
+    def toggle_protect(self):
+        self.sess.protect = not self.sess.protect
+        self.st["msg"] = ("Track keeps frames already labeled (YOLO / your edits / clicks) and uses them as anchors"
+                          if self.sess.protect else
+                          "Track overwrites ALL frames after the current one (including YOLO masks and your edits)")
 
     def to_sam(self):
         t, o = self.st["t"], self.cur_oid(create=False)
@@ -717,6 +749,7 @@ class App:
         S.append(("row", [("Track Needle only", lambda: self.track_cls("needle"))]))
         S.append(("row", [("Track Thread only", lambda: self.track_cls("thread"))]))
         S.append(("row", [("Track all (P)", lambda: self.track(True))]))
+        S.append(("row", [("Keep labeled frames (t)", self.toggle_protect, sess.protect)]))
         S.append(("head", "EDIT"))
         S.append(("row", [("Mask -> SAM2 (g)", self.to_sam)]))
         S.append(("row", [("Clr prompt", self.clear_prompts), ("Clr edits", self.clear_edits)]))
@@ -996,7 +1029,7 @@ class App:
             ord("n"): self.new_obj, ord("]"): lambda: self.switch_obj(1), ord("["): lambda: self.switch_obj(-1),
             ord("z"): self.zoom, ord("0"): self.zoom_reset, ord("x"): self.exclude,
             ord("m"): lambda: self.st.update(show=not self.st["show"]),
-            ord("p"): lambda: self.track(False), ord("P"): lambda: self.track(True),
+            ord("p"): lambda: self.track(False), ord("P"): lambda: self.track(True), ord("t"): self.toggle_protect,
             ord("s"): self.save, ord("q"): self.quit, 27: self.quit,
         }
         if k in (65480, 7995392, 0x7A0000):                     # F11（Linux GTK / Windows）
@@ -1048,6 +1081,7 @@ def save_outputs(sess, imgs, clip, excluded, a, clip_name, sess_path, edits_path
         json.dump({"frames_dir": os.path.abspath(a.frames_dir), "frames": clip, "stride": a.stride,
                    "obj_ids": sess.obj_ids, "obj_cls": {str(o): c for o, c in sess.obj_cls.items()},
                    "excluded": sorted(excluded),
+                   "trusted": {str(f): sorted(v) for f, v in sess.trusted.items() if v},
                    "points": {str(o): {str(k): v for k, v in d.items()} for o, d in sess.points.items()},
                    "boxes": {str(o): {str(k): list(v) for k, v in d.items()} for o, d in sess.boxes.items()}},
                   fs, indent=1)
@@ -1106,6 +1140,7 @@ def load_session(sess, sess_path, edits_path, clip, labels_dir=None):
         for f in (set(sess.points.get(oid, {})) | set(sess.boxes.get(oid, {})) | set(sess.mask_prompts.get(oid, {}))):
             sess.sync(f, oid)
     src = ""
+    sess.trusted = {int(f): set(v) for f, v in old.get("trusted", {}).items()}
     if saved_sam:
         sess.sam = saved_sam
         src = "session 裡的追蹤結果"
@@ -1126,6 +1161,8 @@ def load_session(sess, sess_path, edits_path, clip, labels_dir=None):
                 d[objs[0]] = m
                 for o in objs[1:]:
                     d.pop(o, None)
+                if m.any():
+                    sess.trusted.setdefault(i, set()).add(objs[0])   # 從 Labels（例如 YOLO）讀回的 = 已標好
         if n_lab:
             src = f"Labels 資料夾的 {n_lab} 張 mask"
             if any(len(sess.objs_of(c)) > 1 for c in CLASS_ORDER):
@@ -1452,6 +1489,9 @@ def main():
     ap.add_argument("--start", default="0", help="起始影格：index（整數）或檔名的一部分")
     ap.add_argument("--num", type=int, default=150, help="這段 clip 取幾張")
     ap.add_argument("--stride", type=int, default=3, help="每幾張取一張（15fps、stride 3 = 每秒 5 張）")
+    ap.add_argument("--goto", default=None, help="開啟後直接跳到這張影格：檔名的一部分或 clip 內的 index（從 0 開始）")
+    ap.add_argument("--force_new", action="store_true",
+                    help="這段 clip 已有 session 但影格清單不同時，仍然用新的清單開啟（存檔會蓋掉之前的標註）")
     ap.add_argument("--model", choices=list(CKPTS), default="small")
     ap.add_argument("--ckpt_dir", default="checkpoints_sam2")
     ap.add_argument("--display_width", type=int, default=1280,
@@ -1480,6 +1520,28 @@ def main():
     clip_name = a.clip_name or f"{parent}_{os.path.splitext(clip[0])[0]}"
     print(f"clip {clip_name}：{len(clip)} 張（{clip[0]} ~ {clip[-1]}，stride {a.stride}）")
 
+    # 防呆：這段 clip 已經標過、但這次的 --start / --num / --stride 不同 -> 影格清單對不上，讀不回之前的標註，
+    # 這時存檔（s / q / Ctrl+C）會用空的結果蓋掉之前的 session 與 Labels，所以直接停止並告訴你正確的參數
+    sess_path0 = os.path.join(a.out_dir, "sessions", f"{clip_name}.json")
+    if os.path.isfile(sess_path0) and not a.force_new:
+        old = json.load(open(sess_path0))
+        of = old.get("frames", [])
+        if of and of != clip:
+            print(f"\n[停止] {clip_name} 已經標過，但這次挑出的影格和之前不同（之前 {len(of)} 張、stride {old.get('stride')}；"
+                  f"這次 {len(clip)} 張、stride {a.stride}）。\n"
+                  f"  用這次的參數開啟會讀不回之前的標註，存檔時還會把它們蓋掉。請用之前的參數：\n"
+                  f"  python sam2_video_label.py --frames_dir {a.frames_dir} --out_dir {a.out_dir} "
+                  f"--start {of[0]} --num {len(of)} --stride {old.get('stride', a.stride)}"
+                  + (f" --goto {a.goto}" if a.goto else "") +
+                  "\n  （確定要用新的影格清單重新標這段 clip，才加 --force_new）")
+            sys.exit(1)
+    goto_idx = None
+    if a.goto:
+        goto_idx = int(a.goto) if a.goto.isdigit() else next((i for i, f in enumerate(clip) if a.goto in f), None)
+        if goto_idx is None or not 0 <= goto_idx < len(clip):
+            sys.exit(f"[停止] --goto {a.goto}：這段 clip（stride {a.stride}）裡沒有這張影格。"
+                     f"stride 不是 1 時只有每 {a.stride} 張的那幾張在 clip 裡，請改用 clip 裡的檔名或 index（0 ~ {len(clip) - 1}）")
+
     tmp = tempfile.mkdtemp(prefix="sam2clip_")                 # SAM 2 只吃 <index>.jpg 的資料夾
     imgs = []
     for i, f in enumerate(clip):
@@ -1497,6 +1559,9 @@ def main():
     app = App(sess, imgs, clip, View(W, H, a.display_width),
               lambda: save_outputs(sess, imgs, clip, app.excluded, a, clip_name, sess_path, edits_path), excluded)
     app.pw, app.font_px = int(min(max(a.panel_width, PANEL_MIN), PANEL_MAX)), a.ui_font
+    if goto_idx is not None:
+        app.st["t"] = goto_idx
+        print(f"開在第 {goto_idx + 1}/{len(clip)} 張：{clip[goto_idx]}")
     gui = a.gui
     if gui == "tk":
         try:

@@ -20,9 +20,7 @@ clip 名稱 / 影格挑選規則與 sam2_video_label.py 完全相同：
     - 這段 clip 已經有 Labels 或 session 時會停止（避免蓋掉你修過的結果），確定要覆蓋加 --overwrite
 
 用法:
-    python yolo_autolabel.py --weights runs/segment/train/weights/best.pt \\
-        --frames_dir /data/camera_recordings/20261016_071708/cam_260422273204/rgb \\
-        --start 005136_1792135370.605606445 --stride 15 --out_dir my_needle_thread
+    d
 """
 
 import argparse

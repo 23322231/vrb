@@ -1830,7 +1830,7 @@ def main(args):
                   + src_msg(tm))
 
 
-if __name__ == "__main__":
+def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--vrb_root")
     p.add_argument("--ann", nargs="+",
@@ -1935,6 +1935,11 @@ if __name__ == "__main__":
                    help="預測幾個點：3 = head / tail / middle（同 Wang et al. 2025）；5 = 再加 head_1_3 / tail_1_3")
     p.add_argument("--paper", type=int, default=0,
                    help="1 = 回到 VRB 論文的設定（見 PAPER_PRESET）；命令列上明確給的參數優先")
+    return p
+
+
+if __name__ == "__main__":
+    p = build_parser()
     a = p.parse_args()
     if a.paper and not a.resume:
         given = lambda k: any(s == f"--{k}" or s.startswith(f"--{k}=") for s in sys.argv[1:])

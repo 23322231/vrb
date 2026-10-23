@@ -6,7 +6,7 @@
     1. 依 8:1:1 重新切分 train / val / test：
        - 自己的影片（Images/<clip>/...）：以 clip 為單位，同一段影片的連續影格一定在同一組
        - 學長資料（Images/train|val|test/...）：以影像為單位，left_/right_ 立體影像視為同一組
-    2. train：每根針存 1 張「無增強」裁切 + n_aug 張隨機增強（裁切縮放/位移、水平/上下翻轉、旋轉、色彩）
+    2. train：每根針存 1 張「無增強」裁切 + 1 張「只左右翻轉」（--orig_hflip，預設開）+ n_aug 張隨機增強（裁切縮放/位移、水平/上下翻轉、旋轉、色彩）
        val / test：每根針只存 1 張固定裁切（不做任何隨機增強，才能反映真實表現）
     3. 每張都是 224x224 的裁切圖，5 點座標直接是裁切圖內的 normalized (x, y)
        另外記錄裁切邊長 side_px（原圖 pixel），訓練時用來把誤差換算回原圖 pixel
@@ -273,6 +273,8 @@ def main():
                     help="5 點離裁切邊緣至少保留的比例；不夠時自動放大裁切範圍")
     ap.add_argument("--hflip", type=float, default=0.5)
     ap.add_argument("--vflip", type=float, default=0.5)
+    ap.add_argument("--orig_hflip", type=int, default=1,
+                    help="1 = train 每根針固定多存 1 張「只做左右翻轉」的版本（100%% 翻轉，不做其他增強）；0 = 不存")
     ap.add_argument("--color_aug", type=int, default=1)
     ap.add_argument("--brightness", type=float, default=0.4)
     ap.add_argument("--contrast", type=float, default=0.3)
@@ -411,6 +413,12 @@ def main():
         c, m, pn, S, _ = warp_crop(img, mask, pts, x0, y0, side, 0.0, 0.0)
         versions = [(Image.fromarray(c), m, pn, S,
                      {"crop": [x0, y0, side], "rot_deg": 0.0, "hflip": False, "vflip": False, "grow": 1.0}, "orig")]
+        if sp == "train" and a.orig_hflip:
+            # 固定的左右鏡像版本：同一個裁切、不旋轉、不調色，只翻轉（不消耗 rng，aug 圖與舊版完全相同）
+            c, m, p, sd, _ = warp_crop(img, mask, pts, x0, y0, side, 0.0, 0.0, hflip=True)
+            versions.append((Image.fromarray(c), m, p, sd,
+                             {"crop": [x0, y0, side], "rot_deg": 0.0, "hflip": True, "vflip": False, "grow": 1.0},
+                             "orig_hflip"))
         if sp == "train":
             for k in range(a.n_aug):
                 c, m, p, sd, info = make_aug(img, mask, pts, s["needle_bbox"], a, rng)
@@ -425,7 +433,7 @@ def main():
             if m is not None:
                 mrel = f"{sp}/masks/{name}"
                 cv2.imwrite(os.path.join(a.out_dir, mrel), m)
-            if a.vis == "all" or (a.vis == "some" and j < 3):
+            if a.vis == "all" or (a.vis == "some" and j < 4):
                 draw_check(c, p, os.path.join(a.out_dir, "vis", sp, name), m)
             rec = {
                 "image": rel,
