@@ -105,6 +105,7 @@ segmentation 輔助頭（--seg_weight > 0，且資料有 mask 時才啟用；mas
 import argparse
 import datetime
 import glob
+import itertools
 import json
 import math
 import os
@@ -133,13 +134,24 @@ SWAP_HEAD_TAIL = list(ALL_SWAP)                  # 頭尾互換後的對應順�
 POINT_COLORS = list(ALL_COLORS)
 POINT_SEL = list(range(5))                       # 從標註的 5 點中取哪幾個
 
+# --loss perm（沒有順序性）：每個 channel 不再固定對應某個部位，loss 取「最佳配對」；
+# 評估 / 畫圖時把預測點與 GT 各自排序（--order_by），由左到右命名。_L / _R 提醒：這裡的 head 是「最左邊的點」，不是真的針尖
+ORDER_NAMES = {3: ["head_L", "middle", "tail_R"], 5: ["head_L", "q1", "middle", "q3", "tail_R"]}
+UNORDERED = False                                # True = --loss perm
+ORDER_BY = "x"                                   # perm 時的排序方式：x（由左到右）/ chain（沿著針排）
+GT_NAMES = list(ALL_POINT_NAMES)                 # 標註檔語意名稱（特徵檢查用）
+CHANNEL_NAMES = list(ALL_POINT_NAMES)            # 每個輸出 channel 的名稱（perm 時是 ch0, ch1, ...）
 
-def configure_points(n):
-    global POINT_NAMES, SWAP_HEAD_TAIL, POINT_COLORS, POINT_SEL
+
+def configure_points(n, unordered=False, order_by="x"):
+    global POINT_NAMES, SWAP_HEAD_TAIL, POINT_COLORS, POINT_SEL, UNORDERED, ORDER_BY, GT_NAMES, CHANNEL_NAMES
     if n not in (3, 5):
         raise SystemExit("--points 只支援 3 或 5")
     POINT_SEL = list(range(n))
-    POINT_NAMES = ALL_POINT_NAMES[:n]
+    GT_NAMES = ALL_POINT_NAMES[:n]
+    UNORDERED, ORDER_BY = bool(unordered), order_by
+    POINT_NAMES = ORDER_NAMES[n] if UNORDERED else GT_NAMES
+    CHANNEL_NAMES = [f"ch{k}" for k in range(n)] if UNORDERED else POINT_NAMES
     SWAP_HEAD_TAIL = ALL_SWAP[:n]
     POINT_COLORS = ALL_COLORS[:n]
 
@@ -605,7 +617,7 @@ def write_init_report(net, run_dir, args, ckpt_info, reinit, frozen, used):
         L.append(f"- 新增 segmentation 輔助頭 seg_head（attention 輸出 → Conv1x1 → 56x56 針 mask），"
                  f"loss = {args.seg_weight}×(BCE(pos_weight={args.seg_pos_weight}) + {args.seg_dice}×Dice)；"
                  f"推論時不使用")
-    L.append(f"- loss：官方 obj_loss 公式 5·mean((μ−gt)²)，{'頭尾順序固定' if args.loss == 'ordered' else '頭尾互換取較小（sym）'}；不訓練軌跡分支")
+    L.append(f"- loss：官方 obj_loss 公式 5·mean((μ−gt)²)，{ {'ordered': '頭尾順序固定（第 k 個 channel = 第 k 個部位）', 'sym': '頭尾互換取較小（sym）'}.get(args.loss, f'沒有順序性（perm：K! 種配對取最小，座標與 heatmap loss 共用同一配對；評估時依 {args.order_by} 排序）') }；不訓練軌跡分支")
     txt = "\n".join(L) + "\n"
     with open(os.path.join(run_dir, "init_report.md"), "w", encoding="utf-8") as f:
         f.write(txt)
@@ -680,12 +692,127 @@ def heatmap_loss(gt, args):
 
 
 def contact_loss(pred, gt, mode):
-    """與官方 obj_loss 相同：5 * mean((mu - gt)^2)。sym：每筆取正序 / 頭尾互換較小者。"""
+    """與官方 obj_loss 相同：5 * mean((mu - gt)^2)。sym：每筆取正序 / 頭尾互換較小者。
+    perm：每筆取「所有排列中最小」的 loss（沒有順序性，見 perm_loss）。"""
+    if mode == "perm":
+        return best_perm(contact_cost(pred, gt))[0].mean()
     per = ((pred - gt) ** 2).mean(dim=(1, 2))                                 # (B,)
     if mode == "sym":
         per_sw = ((pred - gt[:, SWAP_HEAD_TAIL]) ** 2).mean(dim=(1, 2))
         per = torch.minimum(per, per_sw)
     return 5.0 * per.mean()
+
+
+# -----------------------------------------------------------------------------
+# 沒有順序性（--loss perm）
+#   ordered：第 k 個 channel 一定對到第 k 個 GT（head channel 只會被 head 的 GT 監督）-> 有順序性
+#   perm   ：K 個 channel 與 K 個 GT 之間取 loss 最小的一對一配對（K! 種排列，3 點 6 種、5 點 120 種，直接全部算）
+#            -> 每個 channel 只要「落在針上某個 GT 點」，不規定是哪一個
+#   ordered 與 perm 的 loss 公式完全一樣（每點的 loss 相加），差別只在「哪個 channel 對哪個 GT」
+# -----------------------------------------------------------------------------
+_PERMS = {}
+
+
+def best_perm(cost):
+    """cost (B, K_pred, K_gt) -> (每筆最小總 cost (B,), 配對 perm (B, K)：pred i 對到 gt perm[i])"""
+    B, K, _ = cost.shape
+    key = (K, cost.device)
+    if key not in _PERMS:
+        _PERMS[key] = torch.tensor(list(itertools.permutations(range(K))), device=cost.device)
+    P = _PERMS[key]                                                           # (K!, K)
+    tot = cost[:, torch.arange(K, device=cost.device)[None, :], P].sum(-1)    # (B, K!)
+    v, idx = tot.min(1)
+    return v, P[idx]
+
+
+def align_gt(pred, gt):
+    """把 GT 重新排列成「第 i 個 = 與第 i 個預測配對的那個」（距離平方和最小的配對）"""
+    _, p = best_perm(((pred[:, :, None] - gt[:, None]) ** 2).sum(-1))
+    return torch.gather(gt, 1, p[..., None].expand(-1, -1, 2)), p
+
+
+def contact_cost(pred, gt):
+    """(B, K, K)：pred i 對 gt j 的官方 obj_loss 貢獻；任一排列的總和 = 該排列下的 5·mean((μ−gt)²)"""
+    K = pred.shape[1]
+    return 5.0 / (2 * K) * ((pred[:, :, None] - gt[:, None]) ** 2).sum(-1)
+
+
+def heatmap_cost(gt, args):
+    """(B, K, K)：第 i 張 heatmap 對第 j 個 GT 高斯的 heatmap loss（與 heatmap_loss 同公式，對角線總和 = ordered 的值）"""
+    x = HM_CACHE.get("x")
+    if x is None:
+        return None
+    B, C, Hh, Ww = x.shape
+    ys = torch.linspace(0, 1, Hh, device=x.device).view(1, 1, Hh, 1)
+    xs = torch.linspace(0, 1, Ww, device=x.device).view(1, 1, 1, Ww)
+    sig = args.hm_sigma / (Ww - 1)
+    t = torch.exp(-((xs - gt[..., 0, None, None]) ** 2 + (ys - gt[..., 1, None, None]) ** 2) / (2 * sig ** 2))
+    t = t.reshape(B, C, -1)
+    xf = x.float().reshape(B, C, -1)
+    N = xf.shape[-1]
+    if args.hm_loss == "mse":
+        # mean((x_i - t_j)^2) = mean(x_i^2) - 2·mean(x_i t_j) + mean(t_j^2)
+        c = (xf ** 2).mean(-1)[:, :, None] - 2 * torch.einsum("bin,bjn->bij", xf, t) / N + (t ** 2).mean(-1)[:, None, :]
+        return c * args.hm_mse_scale / C
+    t = t / t.sum(-1, keepdim=True).clamp_min(1e-12)
+    logp = F.log_softmax(args.kp_beta * xf, dim=-1)
+    ent = (t * torch.log(t.clamp_min(1e-12))).sum(-1)                          # (B, K)
+    return (ent[:, None, :] - torch.einsum("bin,bjn->bij", logp, t)) / C
+
+
+def perm_loss(pred, gt, args, use_hm):
+    """座標 loss 與 heatmap loss 用「同一個」配對（兩者加總後取最小的排列）"""
+    cost = args.contact_weight * contact_cost(pred, gt)
+    if use_hm:
+        hc = heatmap_cost(gt, args)
+        if hc is not None:
+            cost = cost + args.hm_weight * hc
+    return best_perm(cost)[0].mean()
+
+
+def order_index(pts, mode="x"):
+    """(B, K, 2) normalized (x, y) -> (B, K) 排序後的索引
+    x    ：由左到右（x 相同時看 y）。老師的作法
+    chain：沿著針排：距離最遠的兩點當兩端，取比較左邊的那端當起點，其餘點依「離起點的距離」排序
+           （圓弧 ≤ 半圓時兩端就是最遠的兩點，弦長隨弧長單調增加 -> 就是沿弧的順序；縫針 1/4、3/8、1/2 圓都適用）"""
+    if mode == "x":
+        return (pts[..., 0] + 1e-3 * pts[..., 1]).argsort(1)
+    B, K, _ = pts.shape
+    D = torch.cdist(pts.float(), pts.float())
+    f = D.reshape(B, -1).argmax(1)
+    a, b = f // K, f % K
+    ar = torch.arange(B, device=pts.device)
+    start = torch.where(pts[ar, a, 0] <= pts[ar, b, 0], a, b)
+    return D[ar, start].argsort(1)
+
+
+def gather_pts(t, idx):
+    """t (B, K) 或 (B, K, 2)，依 idx (B, K) 重新排列"""
+    if t.dim() == 2:
+        return torch.gather(t, 1, idx)
+    return torch.gather(t, 1, idx[..., None].expand(-1, -1, t.shape[-1]))
+
+
+def heatmap_conf(hm, args):
+    """每個點的信心值 (B, K)，0~1：
+    - 有 MSE heatmap loss（--hm_loss mse --hm_weight > 0，例如 both / mse）：heatmap 的最大值。
+      訓練目標是「峰值 = 1 的高斯」，所以峰值越接近 1 = 模型越確定那裡有這個點（HRNet 等 pose estimation 的 keypoint score）
+    - 只有 contact loss（softmax 分布）：尖峰 ±decode_radius 格內的機率總和 = 有多少機率集中在預測位置附近"""
+    if hm is None:
+        return None
+    hm = hm.float()
+    if args.hm_loss == "mse" and args.hm_weight > 0:
+        return hm.amax(dim=(2, 3)).clamp(0, 1)
+    B, C, Hh, Ww = hm.shape
+    beta = args.kp_beta if args.kp_beta > 0 else 1.0
+    p = torch.softmax(beta * hm.reshape(B, C, -1), dim=-1).reshape(B, C, Hh, Ww)
+    idx = p.reshape(B, C, -1).argmax(-1)
+    iy, ix = (idx // Ww).view(B, C, 1, 1), (idx % Ww).view(B, C, 1, 1)
+    yy = torch.arange(Hh, device=p.device).view(1, 1, Hh, 1)
+    xx = torch.arange(Ww, device=p.device).view(1, 1, 1, Ww)
+    r = args.decode_radius
+    win = ((yy - iy).abs() <= r) & ((xx - ix).abs() <= r)
+    return (p * win).sum(dim=(2, 3))
 
 
 # -----------------------------------------------------------------------------
@@ -702,6 +829,9 @@ def evaluate(net, loader, device, args, vis_dir=None):
     seg_tp = seg_fp = seg_fn = 0.0
     seg_n = 0
     dead = np.zeros(NP())                           # 每個點：整張 heatmap <= 0 的樣本數（ReLU 全死 -> 分布均勻 -> 點落在中心）
+    sum_conf = torch.zeros(NP())
+    got_conf = False
+    pred_rows = []
     by_src = {}                                  # 每個資料集各自的誤差（多資料集合併訓練時用）
     for batch in loader:
         img = batch["img"].to(device)
@@ -730,22 +860,43 @@ def evaluate(net, loader, device, args, vis_dir=None):
         if hm_t is not None and args.decode == "local":
             pred = local_decode(hm_t, args.kp_beta if args.kp_beta > 0 else 1.0, args.decode_radius,
                                 "mse" if args.hm_loss == "mse" else "softmax")
-        # 全圖 soft-argmax 的誤差另外記錄，方便比較兩種解碼
-        e_g = (pred_global - gt).norm(dim=-1)
-        e_gs = (pred_global - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1)
-        if args.loss == "sym":
-            e_g = torch.where((e_gs.mean(1) < e_g.mean(1))[:, None], e_gs, e_g)
-        sum_err_global += (e_g * batch["crop"][:, 2].to(device)[:, None]).sum(0).cpu()
+        conf = heatmap_conf(hm_t, args)                                      # (B, K) 每個 channel 的信心值
         side = batch["crop"][:, 2].to(device)[:, None]
-        err = (pred - gt).norm(dim=-1) * side                                # (B, 5) 原圖 pixel
-        err_sw = (pred - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1) * side
-        flipped = err_sw.mean(1) < err.mean(1)                               # (B,)
-        flips += int(flipped.sum())
-        sum_err_ord += err.sum(0).cpu()
-        if args.loss == "sym":
-            # sym：頭尾順序不計，把 GT 對齊到較接近的那個方向再算誤差（畫圖也用對齊後的 GT）
-            gt = torch.where(flipped[:, None, None], gt[:, SWAP_HEAD_TAIL], gt)
-            err = torch.where(flipped[:, None], err_sw, err)
+        # 全圖 soft-argmax 的誤差另外記錄，方便比較兩種解碼
+        if UNORDERED:
+            e_g = (pred_global - align_gt(pred_global, gt)[0]).norm(dim=-1)
+        else:
+            e_g = (pred_global - gt).norm(dim=-1)
+            e_gs = (pred_global - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1)
+            if args.loss == "sym":
+                e_g = torch.where((e_gs.mean(1) < e_g.mean(1))[:, None], e_gs, e_g)
+        sum_err_global += (e_g * side).sum(0).cpu()
+        gt_ch, pred_ch, conf_ch = gt, pred, conf                             # channel 順序（畫 heatmap 用）
+        if UNORDERED:
+            # 沒有順序性：預測點與 GT 各自排序（由左到右 / 沿針），排第 k 的互相比 -> 老師的評估方式
+            gt_ch, _ = align_gt(pred, gt)                                    # 每個 channel 配到的 GT（最佳配對）
+            sum_err_ord += ((pred - gt_ch).norm(dim=-1) * side).sum(0).cpu() # 最佳配對誤差（排序方式的下限）
+            pi, gi = order_index(pred, ORDER_BY), order_index(gt, ORDER_BY)
+            pred, gt = gather_pts(pred, pi), gather_pts(gt, gi)
+            conf = gather_pts(conf, pi) if conf is not None else None
+            err = (pred - gt).norm(dim=-1) * side
+            # 排序後的配對 ≠ 最佳配對（例如針接近垂直、x 幾乎一樣時，左右順序不穩）
+            flipped = (gather_pts(gt_ch, pi) - gt).abs().amax(dim=(1, 2)) > 1e-6
+            flips += int(flipped.sum())
+        else:
+            err = (pred - gt).norm(dim=-1) * side                            # (B, 5) 原圖 pixel
+            err_sw = (pred - gt[:, SWAP_HEAD_TAIL]).norm(dim=-1) * side
+            flipped = err_sw.mean(1) < err.mean(1)                           # (B,)
+            flips += int(flipped.sum())
+            sum_err_ord += err.sum(0).cpu()
+            if args.loss == "sym":
+                # sym：頭尾順序不計，把 GT 對齊到較接近的那個方向再算誤差（畫圖也用對齊後的 GT）
+                gt = torch.where(flipped[:, None, None], gt[:, SWAP_HEAD_TAIL], gt)
+                err = torch.where(flipped[:, None], err_sw, err)
+            gt_ch = gt
+        if conf is not None:
+            sum_conf += conf.sum(0).cpu()
+            got_conf = True
         sum_err += err.sum(0).cpu()
         n += img.shape[0]
         e_mean = err.mean(1).cpu().tolist()
@@ -756,23 +907,46 @@ def evaluate(net, loader, device, args, vis_dir=None):
             d["flips"] += int(flipped[b])
         if vis_dir:
             os.makedirs(vis_dir, exist_ok=True)
+            cf = conf.cpu().numpy() if conf is not None else None
+            cf_ch = conf_ch.cpu().numpy() if conf_ch is not None else None
             for b in range(img.shape[0]):
                 draw(batch["img_raw"][b].numpy(), gt[b].cpu().numpy(), pred[b].cpu().numpy(),
-                     os.path.join(vis_dir, batch["name"][b]))
+                     os.path.join(vis_dir, batch["name"][b]), conf=cf[b] if cf is not None else None)
+                pred_rows.append({
+                    "name": batch["name"][b], "side_px": float(side[b, 0]),
+                    "names": POINT_NAMES,
+                    "pred": pred[b].cpu().numpy().round(5).tolist(),          # 裁切圖內 normalized (x, y)
+                    "gt": gt[b].cpu().numpy().round(5).tolist(),
+                    "conf": cf[b].round(4).tolist() if cf is not None else None,
+                    "err_px": err[b].cpu().numpy().round(2).tolist()})
                 if hm is not None:
                     hdir = os.path.join(vis_dir, "heatmaps")
                     os.makedirs(hdir, exist_ok=True)
-                    draw_heatmaps(batch["img_raw"][b].numpy(), hm[b], gt[b].cpu().numpy(),
-                                  pred[b].cpu().numpy(), args.kp_beta if args.kp_beta > 0 else 1.0,
+                    draw_heatmaps(batch["img_raw"][b].numpy(), hm[b], gt_ch[b].cpu().numpy(),
+                                  pred_ch[b].cpu().numpy(), args.kp_beta if args.kp_beta > 0 else 1.0,
                                   os.path.join(hdir, batch["name"][b]),
                                   seg=seg_p[b, 0].cpu().numpy() if seg_p is not None else None,
-                                  seg_gt=batch["mask"][b, 0].numpy() if bool(has[b]) else None)
+                                  seg_gt=batch["mask"][b, 0].numpy() if bool(has[b]) else None,
+                                  conf=cf_ch[b] if cf_ch is not None else None)
+    if vis_dir and pred_rows:
+        # 每張圖的預測點、信心值、誤差（之後算 precision / recall 或挑信心門檻用）
+        with open(os.path.join(vis_dir, "predictions.json"), "w") as f:
+            json.dump({"order": ("perm, sorted by " + ORDER_BY) if UNORDERED else "ordered", "samples": pred_rows}, f)
     per = (sum_err / max(n, 1)).tolist()
     per_ord = (sum_err_ord / max(n, 1)).tolist()
     m = {"loss": loss_sum / max(n, 1), "mean_px": float(np.mean(per)), "flip_rate": flips / max(n, 1),
          "mean_px_ordered": float(np.mean(per_ord)), "hm_zero_frac": zero_sum / max(n, 1),
          "mean_px_softargmax": float((sum_err_global / max(n, 1)).mean()),
          "hm_dead_frac": (dead / max(n, 1)).tolist()}
+    if UNORDERED:
+        # perm：mean_px = 排序後逐點比的誤差；mean_px_matched = 最佳配對誤差；
+        # flip_rate / sort_mismatch = 排序後的配對和最佳配對不同的比例（左右排序排錯）
+        m["mean_px_matched"] = m["mean_px_ordered"]
+        m["sort_mismatch"] = m["flip_rate"]
+    if got_conf:
+        conf_mean = (sum_conf / max(n, 1)).tolist()
+        m["conf_mean"] = float(np.mean(conf_mean))
+        m.update({f"{k}_conf": v for k, v in zip(POINT_NAMES, conf_mean)})
     if seg_n:
         m["seg_iou"] = seg_tp / max(seg_tp + seg_fp + seg_fn, 1)
         m["seg_precision"] = seg_tp / max(seg_tp + seg_fp, 1)      # 低 = 把背景 / 夾爪當成針
@@ -798,9 +972,10 @@ def select_metric(m, best_on):
     return m["mean_px"]
 
 
-def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224, seg=None, seg_gt=None):
+def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224, seg=None, seg_gt=None, conf=None):
     """每個點一格：裁切圖 + 該點的機率分布 softmax(beta * heatmap)（JET 色階疊在影像上）。
-    實心點 = GT、空心圈 = 預測。格子上方標出分布最大機率 pmax 與熵比例（越接近 0 越集中、越接近 1 越平）。
+    實心點 = GT、十字 = 預測。格子上方標出信心值 conf、分布最大機率 pmax 與熵比例（越接近 0 越集中、越接近 1 越平）。
+    --loss perm 時每格是一個 channel（ch0, ch1, ...），GT 是該 channel 配對到的那個點。
     - 尖峰落在針的正確部位 -> 有學到
     - 整片均勻 / 尖峰在中心 -> 還沒學到（或 beta 太小）
     - 5 張圖的尖峰都在同一處 -> 五個部位分不開"""
@@ -822,9 +997,10 @@ def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224, seg=None, 
         P = lambda q: (int(round(q[0] * tile)), int(round(q[1] * tile)))
         cv2.circle(over, P(gt[c]), 3, col, -1, cv2.LINE_AA)
         cv2.circle(over, P(gt[c]), 4, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.circle(over, P(pred[c]), 6, col, 2, cv2.LINE_AA)
+        draw_cross(over, P(pred[c]), col, 12, 2)
         head = np.zeros((34, tile, 3), np.uint8)
-        cv2.putText(head, POINT_NAMES[c], (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+        cv2.putText(head, CHANNEL_NAMES[c] + (f"   conf {conf[c]:.2f}" if conf is not None else ""), (6, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
         cv2.putText(head, f"pmax {p.max():.3f}  H {ent:.2f}", (6, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                     (220, 220, 220), 1, cv2.LINE_AA)
         tiles.append(np.vstack([head, over]))
@@ -849,8 +1025,24 @@ def draw_heatmaps(img_rgb, hm_logits, gt, pred, beta, path, tile=224, seg=None, 
     cv2.imwrite(path, np.hstack(tiles[:-1]))
 
 
-def draw(img_rgb, gt, pred, path, scale=3, r=2):
-    """GT：實心 2px 圓；預測：同顏色空心圓（半徑 r+2），並以細線連到對應 GT。"""
+def put_text_outlined(img, text, org, color, scale=0.45, thick=1):
+    """文字底下墊一塊深色底：疊在影像上也看得清楚"""
+    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    x, y = org
+    x0, y0, x1, y1 = max(x - 2, 0), max(y - h - 3, 0), min(x + w + 2, img.shape[1]), min(y + base + 1, img.shape[0])
+    img[y0:y1, x0:x1] = (img[y0:y1, x0:x1] * 0.35).astype(img.dtype)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def draw_cross(img, pt, color, size=14, thick=2):
+    """預測點畫十字（外面一圈黑色描邊）"""
+    cv2.drawMarker(img, pt, (0, 0, 0), cv2.MARKER_CROSS, size + 2, thick + 2, cv2.LINE_AA)
+    cv2.drawMarker(img, pt, color, cv2.MARKER_CROSS, size, thick, cv2.LINE_AA)
+
+
+def draw(img_rgb, gt, pred, path, conf=None, scale=3, r=2):
+    """GT：實心 2px 圓；預測：同顏色十字，並以細線連到對應 GT；十字旁邊的數字 = 信心值（0~1）。
+    左上角圖例也列出每個點的信心值（點靠很近、數字重疊時看這裡）。"""
     img = cv2.resize(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), None, fx=scale, fy=scale,
                      interpolation=cv2.INTER_LINEAR)
     S = 224 * scale
@@ -858,14 +1050,19 @@ def draw(img_rgb, gt, pred, path, scale=3, r=2):
     for g, p, c in zip(gt, pred, POINT_COLORS):
         cv2.line(img, P(g), P(p), c, 1, cv2.LINE_AA)
         cv2.circle(img, P(g), r, c, -1, cv2.LINE_AA)
-        cv2.circle(img, P(p), r + 2, c, 1, cv2.LINE_AA)
+    for k, (p, c) in enumerate(zip(pred, POINT_COLORS)):
+        draw_cross(img, P(p), c)
+        if conf is not None:
+            x, y = P(p)
+            put_text_outlined(img, f"{conf[k]:.2f}", (min(x + 9, S - 40), max(y - 9, 14)), (255, 255, 255))
     y = 16
-    for name, c in zip(POINT_NAMES, POINT_COLORS):
+    for k, (name, c) in enumerate(zip(POINT_NAMES, POINT_COLORS)):
         cv2.circle(img, (10, y - 4), 4, c, -1, cv2.LINE_AA)
-        cv2.putText(img, name, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        put_text_outlined(img, name + (f"  conf {conf[k]:.2f}" if conf is not None else ""), (20, y),
+                          (255, 255, 255))
         y += 16
-    cv2.putText(img, "filled = GT   ring = pred", (8, S - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (255, 255, 255), 1, cv2.LINE_AA)
+    put_text_outlined(img, "dot = GT   + = pred" + ("   number = confidence" if conf is not None else ""),
+                      (8, S - 10), (255, 255, 255), 0.5)
     cv2.imwrite(path, img)
 
 
@@ -959,7 +1156,7 @@ def draw_feature_grid(img_rgb, gt, side, per_layer, path, tile=128):
         cv2.putText(h, text, (3, 13), font, 0.36, col, 1, cv2.LINE_AA)
         return np.vstack([h, im])
 
-    titles = ["image", "energy |f|"] + POINT_NAMES
+    titles = ["image", "energy |f|"] + GT_NAMES
     hdr = [np.zeros((20, lab_w, 3), np.uint8)]
     for j, t in enumerate(titles):
         h = np.zeros((20, tile, 3), np.uint8)
@@ -1033,7 +1230,7 @@ def feature_probe(net, probe, protos, loader, device, out_dir=None, n_draw=0):
     out = {}
     for L, d in acc.items():
         per = (d["err"] / max(n, 1)).tolist()
-        out[L] = {"argmax_err_mean": float(np.mean(per)), **{f"{k}_err": v for k, v in zip(POINT_NAMES, per)},
+        out[L] = {"argmax_err_mean": float(np.mean(per)), **{f"{k}_err": v for k, v in zip(GT_NAMES, per)},
                   "proto_acc": d["cls"] / max(5 * n, 1), "head_tail_acc": d["ht"] / max(2 * n, 1),
                   "energy_ratio": d["eratio"] / max(n, 1)}
     return out, n
@@ -1170,7 +1367,7 @@ def draw_cam_grid(img_rgb, gt, pred, side, cams, prob, path, tile=128):
         return im
 
     hdr = [np.zeros((20, lab_w, 3), np.uint8)]
-    for j, t in enumerate(["image"] + POINT_NAMES):
+    for j, t in enumerate(["image"] + CHANNEL_NAMES):
         h = np.zeros((20, tile, 3), np.uint8)
         cv2.putText(h, t, (4, 14), font, 0.45, POINT_COLORS[j - 1] if j else (255, 255, 255), 1, cv2.LINE_AA)
         hdr += [np.full((20, gap, 3), 40, np.uint8), h]
@@ -1217,6 +1414,8 @@ def attention_maps(net, cam, loader, device, args, out_dir, n_draw):
             if drawn >= n_draw:
                 break
             gt = batch["pts"][b].numpy()
+            if UNORDERED:                    # perm：channel 沒有固定部位 -> GT 換成每個 channel 配對到的點
+                gt = align_gt(pred[b:b + 1].float(), batch["pts"][b:b + 1].float())[0][0].numpy()
             side = float(batch["crop"][b, 2])
             mask = batch["mask"][b, 0].numpy() if float(batch["has_mask"][b]) > 0 else None
             per = {}
@@ -1244,10 +1443,10 @@ def print_feature_table(epoch, res, n_tr, n_val):
     print(f"[特徵檢查 ep {epoch}] 原型：train 原圖 {n_tr} 根針；val {n_val} 根針"
           f"（{NP()} 點分類隨機 = {100 // NP()}%，頭尾分類隨機 = 50%；能量比 > 1 = 針上的特徵比背景強）")
     print(f"    {'layer':7s} {'argmax誤差':>10s} {f'{NP()}點分類':>8s} {'頭尾分類':>8s} {'能量比':>7s}   各點誤差 "
-          + "/".join(POINT_NAMES) + " (px)")
+          + "/".join(GT_NAMES) + " (px)")
     for L, r in res.items():
         print(f"    {L:7s} {r['argmax_err_mean']:8.1f}px {r['proto_acc']:8.0%} {r['head_tail_acc']:8.0%} "
-              f"{r['energy_ratio']:7.2f}   " + " / ".join(f"{r[k + '_err']:.0f}" for k in POINT_NAMES))
+              f"{r['energy_ratio']:7.2f}   " + " / ".join(f"{r[k + '_err']:.0f}" for k in GT_NAMES))
 
 
 def plot_feature_curves(run_dir):
@@ -1392,6 +1591,8 @@ def plot_curves(run_dir):
     apath = os.path.join(run_dir, "args.json")
     if os.path.isfile(apath) and json.load(open(apath)).get("loss") == "sym":
         sym_note = " (head/tail order ignored)"
+    elif os.path.isfile(apath) and json.load(open(apath)).get("loss") == "perm":
+        sym_note = f" (unordered, sorted by {json.load(open(apath)).get('order_by', 'x')})"
     ax.set_title("Point error in original-image pixels" + sym_note, color=ink, fontsize=11, loc="left")
     ax.set_ylabel("px", color=muted)
     ax.set_ylim(bottom=0)
@@ -1535,8 +1736,14 @@ def main(args):
 
     if not hasattr(args, "points") or args.points is None:
         args.points = 5
-    configure_points(args.points)
-    print(f"[NOTE] 預測 {NP()} 個點：{', '.join(POINT_NAMES)}")
+    if not hasattr(args, "order_by") or args.order_by is None:
+        args.order_by = "x"
+    configure_points(args.points, args.loss == "perm", args.order_by)
+    print(f"[NOTE] 預測 {NP()} 個點：{', '.join(GT_NAMES)}")
+    if UNORDERED:
+        print(f"[NOTE] --loss perm（沒有順序性）：{NP()} 個 channel 不指定部位，loss 取 {math.factorial(NP())} 種配對中最小的；"
+              f"評估時預測與 GT 各自依「{'由左到右（x）' if ORDER_BY == 'x' else '沿著針（chain）'}」排序後逐點比，"
+              f"命名為 {', '.join(POINT_NAMES)}")
     ann = load_annotations(args.ann if isinstance(args.ann, list) else [args.ann])
     offline = ann.get("format") == "needle5_crops"
     if args.train_splits is None:
@@ -1678,10 +1885,14 @@ def main(args):
 
     # 平均位置 baseline：每個點都預測「訓練集該點的平均位置」，模型至少要比這個好
     if val_loader and not resumed:
-        tr_pts = torch.stack([train_eval_set[i]["pts"] for i in range(len(train_eval_set))]).mean(0)
+        tr_all = torch.stack([train_eval_set[i]["pts"] for i in range(len(train_eval_set))])
+        if UNORDERED:                               # perm：先排序再平均（排第 k 的點的平均位置）
+            tr_all = gather_pts(tr_all, order_index(tr_all, ORDER_BY))
+        tr_pts = tr_all.mean(0)
         errs = []
         for b in val_loader:
-            e_o = (tr_pts[None] - b["pts"]).norm(dim=-1) * b["crop"][:, 2:3]
+            vp = gather_pts(b["pts"], order_index(b["pts"], ORDER_BY)) if UNORDERED else b["pts"]
+            e_o = (tr_pts[None] - vp).norm(dim=-1) * b["crop"][:, 2:3]
             if args.loss == "sym":
                 e_s = (tr_pts[None] - b["pts"][:, SWAP_HEAD_TAIL]).norm(dim=-1) * b["crop"][:, 2:3]
                 e_o = torch.where((e_s.mean(1) < e_o.mean(1))[:, None], e_s, e_o)
@@ -1738,9 +1949,12 @@ def main(args):
                 img = batch["img"].to(device)
                 gt = batch["pts"].to(device)
                 HM_CACHE.pop("attn", None)
-                loss = args.contact_weight * contact_loss(predict_xy(net, img, args), gt, args.loss)
-                if use_hm:
-                    loss = loss + args.hm_weight * heatmap_loss(gt, args)
+                if args.loss == "perm":
+                    loss = perm_loss(predict_xy(net, img, args), gt, args, use_hm)
+                else:
+                    loss = args.contact_weight * contact_loss(predict_xy(net, img, args), gt, args.loss)
+                    if use_hm:
+                        loss = loss + args.hm_weight * heatmap_loss(gt, args)
                 if use_seg:
                     ls = seg_loss(seg_logits(net), batch["mask"].to(device), batch["has_mask"].to(device),
                                   args.seg_pos_weight, args.seg_dice)
@@ -1766,9 +1980,11 @@ def main(args):
                 vm = evaluate(net, val_loader, device, args,
                               os.path.join(run_dir, "vis", f"epoch{epoch:04d}_val") if do_vis else None)
                 rec["val"] = vm
-                msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else ''} {vm['mean_px']:.1f}px ("
+                msg += (f" | val mean{' (head/tail aligned)' if args.loss == 'sym' else (' (sorted ' + ORDER_BY + ')' if UNORDERED else '')} {vm['mean_px']:.1f}px ("
                         + " ".join(f"{k} {vm[k + '_px']:.1f}" for k in POINT_NAMES) + ") "
-                        f"flip {vm['flip_rate']:.0%}"
+                        + (f"matched {vm['mean_px_matched']:.1f}px sort-mismatch {vm['sort_mismatch']:.0%}" if UNORDERED
+                           else f"flip {vm['flip_rate']:.0%}")
+                        + (f" conf {vm['conf_mean']:.2f}" if "conf_mean" in vm else "")
                         + (f" hm0 {vm['hm_zero_frac']:.0%} | soft-argmax(全圖) {vm['mean_px_softargmax']:.1f}px"
                            if not args.attn_kp_fc else "")
                         + (" | dead " + "/".join(f"{d:.0%}" for d in vm["hm_dead_frac"])
@@ -1826,7 +2042,10 @@ def main(args):
             with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
                 json.dump(tm, f, indent=2)
             print(f"[test, best 權重] {len(test_set)} 張  mean {tm['mean_px']:.1f}px  "
-                  + "  ".join(f"{k} {tm[k + '_px']:.1f}" for k in POINT_NAMES) + f"  flip {tm['flip_rate']:.0%}"
+                  + "  ".join(f"{k} {tm[k + '_px']:.1f}" for k in POINT_NAMES)
+                  + (f"  matched {tm['mean_px_matched']:.1f}px  sort-mismatch {tm['sort_mismatch']:.0%}" if UNORDERED
+                     else f"  flip {tm['flip_rate']:.0%}")
+                  + (f"  conf {tm['conf_mean']:.2f}" if "conf_mean" in tm else "")
                   + src_msg(tm))
 
 
@@ -1906,7 +2125,12 @@ def build_parser():
     p.add_argument("--hue", type=float, default=0.05)
 
     # 訓練
-    p.add_argument("--loss", choices=["ordered", "sym"], default="ordered")
+    p.add_argument("--loss", choices=["ordered", "sym", "perm"], default="ordered",
+                   help="ordered：第 k 個 channel 固定對第 k 個部位（有順序性）；sym：只允許頭尾互換；"
+                        "perm：沒有順序性，K 個 channel 與 K 個 GT 取 loss 最小的配對，評估時再排序（--order_by）")
+    p.add_argument("--order_by", choices=["x", "chain"], default="x",
+                   help="--loss perm 評估 / 畫圖時的排序：x = 由左到右（老師的作法）；"
+                        "chain = 沿著針排（最遠兩點當兩端、從左邊那端開始），針開口朝左右時比較穩")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
