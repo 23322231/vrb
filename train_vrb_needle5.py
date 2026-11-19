@@ -62,6 +62,26 @@ segmentation 輔助頭（--seg_weight > 0，且資料有 mask 時才啟用；mas
 - 學習曲線：每 --plot_every 個 epoch 更新 <run>/curves.png（train / val loss 與 val 各點 pixel 誤差）
   也可以隨時另外畫：python train_vrb_needle5.py --plot_only runs/needle5_fc1_20261012_181530
 
+線上增強 v2（2026-11-16，--online_aug v2，format A 的預設）：
+    直接呼叫 build_needle5_aug.py 的 make_aug / warp_crop（影像、針 mask、5 點用同一個仿射矩陣），每次讀圖時
+    當場產生一張增強圖，不存檔，所以增強的分佈和離線版（needle5_thread_aug）完全相同，也有 mask（seg 輔助頭可用）。
+    - 可以給多個 mask_to_needle5.py 的 annotations.json（各自的 images_root / labels_root / Color_code.txt）
+    - 切分：--val_groups / --test_groups（影像路徑包含其中任一字串就是 val / test，其餘 train）；沒給就用每筆的 split
+    - --online_repeat N：每個 epoch 每根針出現 N 次（每次是不同的隨機增強）。離線版每根針有 1 張原圖 + 1 張翻轉
+      + 10 張增強 = 12 張，所以 N=12 時一個 epoch 的步數和以前一樣，--epochs 可以沿用
+    - --p_orig：每次有這個機率直接用不增強的原圖裁切（離線版約 1/12）
+    - val / test / train_eval 一律用不增強的固定裁切（和 handover_perception.py 的 crop_mode=train 相同）
+    範例（舊資料 + 新的 handover 資料）：
+        python train_vrb_needle5.py --vrb_root . \
+            --ann needle5_thread/annotations.json needle5_handover_train/annotations.json \
+            --val_groups 002101 000751_1794811626 --test_groups 002901 \
+            --online_repeat 12 --scale_jitter 0.3 --center_jitter 0.25 \
+            --pretrained ./models/model_checkpoint_1249.pth.tar --paper 1 --seg_weight 0.5 \
+            --epochs 60 --exp handover_v3
+
+視覺化（2026-11-16 起）：--vis_every 0（預設）= 只在 epoch 0（訓練前）與最後一個 epoch 輸出 heatmap、注意力圖、
+    特徵圖；--vis_train 0（預設）= train 集只算數字、不存每張圖；--save_every 0（預設）= 不另外存 model_epXXXX。
+
 兩種資料格式（自動辨識）:
     A. mask_to_needle5.py 的 annotations.json      -> 線上增強（每次讀圖時隨機裁切 / 翻轉 / 旋轉 / 色彩）
        預設 train = train+val、val = test
@@ -300,6 +320,62 @@ class Needle5CropDataset(Dataset):
             "name": name,
             "src": s.get("_src", "data"),
             "mask": mask,
+            "has_mask": torch.tensor(has),
+        }
+
+
+class Needle5OnlineDataset(Dataset):
+    """線上增強 v2：mask_to_needle5.py 的 annotations.json（原圖 + 針 mask + 5 點 pixel）→ 每次讀取時當場增強。
+    增強直接呼叫 build_needle5_aug.make_aug（裁切 / 位移 / 縮放 / 旋轉合成一個 cv2.warpAffine，影像、mask、
+    5 點同一個矩陣；再加翻轉與色彩），所以和離線版的分佈相同。train=False 時用不增強的固定裁切。"""
+
+    def __init__(self, ann, splits, args, train, repeat=1):
+        import build_needle5_aug as B
+        self.B = B
+        self.samples = [s for s in ann["samples"] if s["split"] in splits and s.get("head_confirmed", True)]
+        self.args, self.train = args, train
+        self.repeat = max(1, int(repeat)) if train else 1
+        self.tf = transforms.Compose([transforms.ToTensor(),
+                                      transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
+
+    def __len__(self):
+        return len(self.samples) * self.repeat
+
+    def __getitem__(self, i):
+        s = self.samples[i % len(self.samples)]
+        a, B = self.args, self.B
+        img = cv2.imread(os.path.join(s["_images_root"], s["image"]), cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(os.path.join(s["_images_root"], s["image"]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mask = None
+        if s.get("mask") and s.get("_labels_root") and s.get("_needle_color") is not None:
+            cid, color = s["_needle_color"]
+            mask = B.load_needle_mask(os.path.join(s["_labels_root"], s["mask"]), cid, color, 10)
+        pts = np.asarray(s["points_px"], dtype=np.float64)
+        H, W = img.shape[:2]
+        if self.train and random.random() >= a.p_orig:
+            crop, m, pn, S, _ = B.make_aug(img, mask, pts, s["needle_bbox"], a, random)
+        else:
+            x0, y0, side = B.needle_crop(s["needle_bbox"], W, H, a, None)
+            hf = self.train and random.random() < a.hflip          # 原圖也有一半機率翻轉（同離線版 orig_hflip）
+            crop, m, pn, S, _ = B.warp_crop(img, mask, pts, x0, y0, side, 0.0, 0.0, hflip=hf)
+            crop = Image.fromarray(crop)
+        if not isinstance(crop, Image.Image):
+            crop = Image.fromarray(crop)
+        mt, has = torch.zeros(1, SEG_SIZE, SEG_SIZE), 0.0
+        if m is not None:
+            mm = cv2.resize(m, (SEG_SIZE, SEG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+            mt, has = torch.from_numpy(mm)[None], 1.0
+        pn = np.asarray(pn, np.float32)
+        return {
+            "img": self.tf(crop),
+            "img_raw": torch.from_numpy(np.asarray(crop).copy()),
+            "pts": torch.from_numpy(pn[POINT_SEL]),
+            "crop": torch.tensor([0, 0, float(S)], dtype=torch.float32),      # side：誤差換算回原圖 pixel
+            "name": f"{s['_src']}__{os.path.splitext(os.path.basename(s['image']))[0]}_n{s.get('needle_id', 0)}.png",
+            "src": s.get("_src", "data"),
+            "mask": mt,
             "has_mask": torch.tensor(has),
         }
 
@@ -1539,7 +1615,8 @@ def plot_curves(run_dir):
     pt_colors = ALL_HEX[:NP()]                                         # 與 vis 圖的點同色系
 
     srcs = sorted({s for e in ve for s in recs[e]["val"].get("by_src", {})})
-    multi = len(srcs) > 1
+    # 第三格「各資料集的 val 誤差」預設不畫，讓 curves.png 和以前的 run 版面相同（數字仍在終端機與 log.jsonl）
+    multi = len(srcs) > 1 and bool(globals().get("PLOT_BY_SRC", 0))
     fig, axes = plt.subplots(1, 3 if multi else 2, figsize=(19 if multi else 13, 4.6), dpi=120)
     for ax in axes:
         ax.set_facecolor("white")
@@ -1683,10 +1760,17 @@ def load_annotations(paths):
         a = anns[0]
         for s in a.get("samples", []):
             s["_src"] = srcs[0]
+            s["_ann"] = a
         a["_srcs"], a["_dirs"] = srcs, dirs
         return a
+    if all(a.get("format") != "needle5_crops" for a in anns):          # 多個 mask_to_needle5 的 annotations（線上增強）
+        merged = {"samples": [], "_srcs": srcs, "_dirs": dirs, "images_root": anns[0].get("images_root")}
+        for a, s_name, d in zip(anns, srcs, dirs):
+            for s in a["samples"]:
+                merged["samples"].append({**s, "_src": s_name, "_ann": a})
+        return merged
     if any(a.get("format") != "needle5_crops" for a in anns):
-        sys.exit("[ERROR] 多個 --ann 只支援 build_needle5_aug.py 產生的離線增強資料（format: needle5_crops）")
+        sys.exit("[ERROR] 不能混用離線增強資料（format: needle5_crops）和 mask_to_needle5 的 annotations.json")
     merged = {"format": "needle5_crops", "samples": [], "_srcs": srcs, "_dirs": dirs}
     for a, s_name, d in zip(anns, srcs, dirs):
         for s in a["samples"]:
@@ -1694,7 +1778,51 @@ def load_annotations(paths):
     return merged
 
 
+def prepare_online(ann, args):
+    """線上增強 v2：每筆補上影像 / mask 的根目錄與針的顏色，並依 --val_groups / --test_groups 重新切分。"""
+    import build_needle5_aug as B
+    cache = {}
+    for s in ann["samples"]:
+        a = s.get("_ann", ann)
+        key = id(a)
+        if key not in cache:
+            img_root = a.get("images_root")
+            lab_root = a.get("labels_root")
+            for r in ("img", "lab"):
+                v = img_root if r == "img" else lab_root
+                if v and not os.path.isabs(v):
+                    v = os.path.abspath(v)
+                if r == "img":
+                    img_root = v
+                else:
+                    lab_root = v
+            color = None
+            if lab_root and os.path.isdir(lab_root):
+                ct = B.find_color_txt(lab_root)
+                if ct:
+                    cmap = B.parse_color_txt(ct)
+                    color = cmap.get("needle")
+            if not img_root or not os.path.isdir(img_root):
+                sys.exit(f"[ERROR] 找不到影像資料夾 {img_root}（{s.get('_src')} 的 annotations.json 裡的 images_root）")
+            if color is None:
+                print(f"[WARN] {s.get('_src')}：找不到 labels_root 或 Color_code.txt，這份資料不使用 mask（seg 輔助頭）")
+            cache[key] = (img_root, lab_root, color)
+        s["_images_root"], s["_labels_root"], s["_needle_color"] = cache[key]
+        if args.val_groups or args.test_groups:
+            rel = s["image"]
+            if args.test_groups and any(g in rel for g in args.test_groups):
+                s["split"] = "test"
+            elif args.val_groups and any(g in rel for g in args.val_groups):
+                s["split"] = "val"
+            else:
+                s["split"] = "train"
+    for s in ann["samples"]:
+        s.pop("_ann", None)                     # DataLoader 的 worker 不需要整份 annotations
+
+
 def main(args):
+    global PLOT_BY_SRC
+    PLOT_BY_SRC = getattr(args, "plot_by_src", 0)
     if not torch.cuda.is_available():
         sys.exit("[ERROR] 官方 VRBModel 在 __init__ 內對 BatchNorm 呼叫了 .cuda()，需要 GPU")
     device = torch.device("cuda")
@@ -1715,6 +1843,9 @@ def main(args):
         run_dir = make_run_dir(args.out_dir)
         # 保存這次用的程式碼，之後可以知道每個結果是哪一版程式訓練出來的
         shutil.copy2(os.path.abspath(__file__), os.path.join(run_dir, "train_vrb_needle5.py"))
+        _aug_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_needle5_aug.py")
+        if os.path.isfile(_aug_py):                       # 線上增強 v2 用到的增強程式也存一份
+            shutil.copy2(_aug_py, os.path.join(run_dir, "build_needle5_aug.py"))
         for k in ("vrb_root", "pretrained"):
             if not (k == "pretrained" and is_scratch(args.pretrained)):
                 setattr(args, k, os.path.abspath(getattr(args, k)))
@@ -1746,10 +1877,11 @@ def main(args):
               f"命名為 {', '.join(POINT_NAMES)}")
     ann = load_annotations(args.ann if isinstance(args.ann, list) else [args.ann])
     offline = ann.get("format") == "needle5_crops"
+    online_v2 = not offline and args.online_aug == "v2"
     if args.train_splits is None:
-        args.train_splits = ["train"] if offline else ["train", "val"]
+        args.train_splits = ["train"] if (offline or online_v2) else ["train", "val"]
     if args.val_splits is None:
-        args.val_splits = ["val"] if offline else ["test"]
+        args.val_splits = ["val"] if (offline or online_v2) else ["test"]
     images_root = args.images_root or (ann["_dirs"][0] if offline else ann.get("images_root"))
     if not images_root or not os.path.isdir(images_root):
         sys.exit(f"[ERROR] 找不到影像資料夾 {images_root}，請用 --images_root 指定（container 內的路徑）")
@@ -1774,6 +1906,18 @@ def main(args):
             for s in ann["_srcs"]:
                 print(f"    [{s}] train {sum(x['_src'] == s for x in train_set.samples)} 張 / "
                       f"val {sum(x['_src'] == s for x in val_set.samples)} 張")
+    elif args.online_aug == "v2":
+        prepare_online(ann, args)
+        train_set = Needle5OnlineDataset(ann, args.train_splits, args, train=True, repeat=args.online_repeat)
+        val_set = Needle5OnlineDataset(ann, args.val_splits, args, train=False)
+        train_eval_set = Needle5OnlineDataset(ann, args.train_splits, args, train=False)
+        n_tr = len(train_eval_set)
+        print(f"[線上增強 v2] train {n_tr} 根針 × repeat {args.online_repeat} = 每個 epoch {len(train_set)} 張 "
+              f"({args.train_splits}) / val {len(val_set)} 根針 ({args.val_splits})；mask："
+              f"{sum(1 for x in train_eval_set.samples if x.get('_needle_color') is not None)}/{n_tr}")
+        for src in ann["_srcs"]:
+            print(f"    [{src}] train {sum(x['_src'] == src for x in train_eval_set.samples)} / "
+                  f"val {sum(x['_src'] == src for x in val_set.samples)} 根針")
     else:
         train_set = Needle5Dataset(ann, args.images_root, args.train_splits, args, train=True)
         val_set = Needle5Dataset(ann, args.images_root, args.val_splits, args, train=False)
@@ -1782,7 +1926,7 @@ def main(args):
     if len(train_set) == 0:
         sys.exit("[ERROR] 沒有訓練資料")
     bs = min(args.batch_size, len(train_set))
-    if args.balance and offline and len(ann["_srcs"]) > 1:
+    if args.balance and (offline or online_v2) and len(ann["_srcs"]) > 1:
         # 每個資料集被抽到的機率相同（不然張數多的那份會主導訓練）；每個 epoch 的張數不變
         cnt = {}
         for x in train_set.samples:
@@ -1975,7 +2119,7 @@ def main(args):
             if use_seg:
                 rec["train_seg_loss"] = seg_tot / n
                 msg += f" (seg {seg_tot / n:.3f})"
-            do_vis = epoch % args.vis_every == 0 or epoch == args.epochs
+            do_vis = (args.vis_every > 0 and epoch % args.vis_every == 0) or epoch == args.epochs
             if val_loader and (epoch % args.eval_every == 0 or do_vis):
                 vm = evaluate(net, val_loader, device, args,
                               os.path.join(run_dir, "vis", f"epoch{epoch:04d}_val") if do_vis else None)
@@ -1999,7 +2143,7 @@ def main(args):
                     msg += "  *best*"
             if do_vis:
                 tm = evaluate(net, train_eval_loader, device, args,
-                              os.path.join(run_dir, "vis", f"epoch{epoch:04d}_train"))
+                              os.path.join(run_dir, "vis", f"epoch{epoch:04d}_train") if args.vis_train else None)
                 rec["train_eval"] = tm
                 msg += f" | train mean {tm['mean_px']:.1f}px"
             print(msg + f" | {time.time() - t0:.1f}s")
@@ -2009,7 +2153,7 @@ def main(args):
                 run_cam(epoch)
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
-            if epoch % args.save_every == 0:
+            if args.save_every > 0 and epoch % args.save_every == 0:
                 torch.save(net.state_dict(), os.path.join(run_dir, f"model_ep{epoch:04d}.pth.tar"))
             if epoch % args.ckpt_every == 0 or epoch == args.epochs:
                 save_checkpoint(ckpt_path, net, optim, epoch, step, best, args)
@@ -2034,6 +2178,7 @@ def main(args):
     best_path = os.path.join(run_dir, "model_best.pth.tar")
     if test_splits and os.path.isfile(best_path):
         test_set = (Needle5CropDataset(ann, args.images_root, test_splits) if offline
+                    else Needle5OnlineDataset(ann, test_splits, args, train=False) if online_v2
                     else Needle5Dataset(ann, args.images_root, test_splits, args, train=False))
         if len(test_set):
             net.load_state_dict(torch.load(best_path, map_location=device, weights_only=False))
@@ -2123,6 +2268,18 @@ def build_parser():
     p.add_argument("--rot_deg", type=float, default=180, help="訓練時隨機旋轉 ±rot_deg 度（0 = 關閉）")
     p.add_argument("--color_aug", type=int, default=1)
     p.add_argument("--hue", type=float, default=0.05)
+    # 線上增強 v2（build_needle5_aug.make_aug 用的參數，名稱與該檔相同）
+    p.add_argument("--online_aug", default="v2", choices=["v2", "legacy"],
+                   help="mask_to_needle5 格式資料的線上增強：v2 = build_needle5_aug 的增強（含 mask）；legacy = 舊版（沒有 mask）")
+    p.add_argument("--online_repeat", type=int, default=1, help="v2：每個 epoch 每根針出現幾次（每次不同增強）")
+    p.add_argument("--p_orig", type=float, default=1 / 12, help="v2：直接用不增強原圖裁切的機率")
+    p.add_argument("--keep_margin", type=float, default=0.04, help="v2：旋轉後點要留在裁切內的邊界比例")
+    p.add_argument("--brightness", type=float, default=0.4)
+    p.add_argument("--contrast", type=float, default=0.3)
+    p.add_argument("--saturation", type=float, default=0.3)
+    p.add_argument("--grayscale", type=float, default=0.05)
+    p.add_argument("--val_groups", nargs="+", default=None, help="v2：影像路徑含其中任一字串 → val（例如 002101）")
+    p.add_argument("--test_groups", nargs="+", default=None, help="v2：影像路徑含其中任一字串 → test（例如 002901）")
 
     # 訓練
     p.add_argument("--loss", choices=["ordered", "sym", "perm"], default="ordered",
@@ -2142,10 +2299,14 @@ def build_parser():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--eval_every", type=int, default=1)
-    p.add_argument("--vis_every", type=int, default=25)
-    p.add_argument("--save_every", type=int, default=50)
+    p.add_argument("--vis_every", type=int, default=0,
+                   help="每幾個 epoch 輸出 heatmap / 注意力圖 / 特徵圖；0 = 只在 epoch 0（訓練前）與最後一個 epoch")
+    p.add_argument("--vis_train", type=int, default=0, help="1 = 視覺化時也存 train 集每張圖（很佔空間）；0 = 只算數字")
+    p.add_argument("--save_every", type=int, default=0, help="每幾個 epoch 另存 model_epXXXX（0 = 不存，只留 best / last）")
     p.add_argument("--ckpt_every", type=int, default=10)
     p.add_argument("--plot_every", type=int, default=5, help="每幾個 epoch 更新一次 curves.png")
+    p.add_argument("--plot_by_src", type=int, default=0,
+                   help="1 = curves.png 多畫一格「各資料集的 val 誤差」（多個 --ann 時）；0 = 和以前一樣兩格")
     p.add_argument("--plot_only", default=None, metavar="RUN_DIR",
                    help="不訓練，只依 RUN_DIR/log.jsonl 畫 curves.png（訓練中也可以用）")
     p.add_argument("--feat_probe", type=int, default=1,
@@ -2180,6 +2341,7 @@ if __name__ == "__main__":
         a.out_dir = os.path.join(os.path.dirname(a.out_dir.rstrip("/")) or ".", a.exp,
                                  os.path.basename(a.out_dir.rstrip("/")))
     if a.plot_only:
+        PLOT_BY_SRC = a.plot_by_src
         out = plot_curves(a.plot_only)
         print(f"→ {out}" if out else f"[ERROR] {a.plot_only} 裡沒有 log.jsonl")
         fo = plot_feature_curves(a.plot_only)

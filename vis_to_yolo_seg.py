@@ -24,6 +24,13 @@
 
     # 訓練（YOLO26 segmentation；第一次會自動下載 yolo26s-seg.pt）
     yolo segment train model=yolo26s-seg.pt data=needle_yolo_seg/data.yaml imgsz=640 epochs=100 batch=8
+
+    # 多個資料來源合成一份（2026-11-16）：同一個 --out_dir 跑多次會累加；data.yaml 依資料夾裡實際有的 split 重寫。
+    # --link：影像用硬連結（同一個磁碟時不佔額外空間；不能硬連結時改符號連結，再不行才複製）
+    python vis_to_yolo_seg.py --needle5_dir needle5_thread --out_dir needle_yolo_seg_v3 --classes Needle \
+        --val_clips 002101 --test_clips 002901 --link
+    python vis_to_yolo_seg.py --needle5_dir needle5_handover_train --out_dir needle_yolo_seg_v3 --classes Needle \
+        --val_clips 000751_1794811626 --link
 """
 
 import argparse
@@ -87,6 +94,7 @@ def main():
     ap.add_argument("--min_area", type=int, default=10, help="小於此面積的碎片忽略 (px)")
     ap.add_argument("--eps", type=float, default=0.7, help="polygon 簡化程度 (px)；細的針 / 線請保持很小")
     ap.add_argument("--n_vis", type=int, default=20)
+    ap.add_argument("--link", action="store_true", help="影像用硬連結（不佔空間）取代複製；失敗時改符號連結，再失敗才複製")
     a = ap.parse_args()
 
     ann_path = os.path.join(a.needle5_dir, "annotations.json")
@@ -162,7 +170,18 @@ def main():
         lab_dst = os.path.join(a.out_dir, "labels", sp, os.path.splitext(flat)[0] + ".txt")
         os.makedirs(os.path.dirname(img_dst), exist_ok=True)
         os.makedirs(os.path.dirname(lab_dst), exist_ok=True)
-        shutil.copy2(img_src, img_dst)
+        if a.link:
+            if os.path.lexists(img_dst):
+                os.remove(img_dst)
+            try:
+                os.link(img_src, img_dst)
+            except OSError:
+                try:
+                    os.symlink(os.path.abspath(img_src), img_dst)
+                except OSError:
+                    shutil.copy2(img_src, img_dst)
+        else:
+            shutil.copy2(img_src, img_dst)
         with open(lab_dst, "w") as f:
             f.write("\n".join(lines) + ("\n" if lines else ""))
 
@@ -185,8 +204,8 @@ def main():
     yaml_path = os.path.join(a.out_dir, "data.yaml")
     with open(yaml_path, "w") as f:
         f.write(f"path: {os.path.abspath(a.out_dir)}\n")
-        for sp in ("train", "val", "test"):
-            if sp in stats:
+        for sp in ("train", "val", "test"):           # 依資料夾裡實際有的 split（同一個 out_dir 跑多次時會累加）
+            if sp in stats or os.path.isdir(os.path.join(a.out_dir, "images", sp)):
                 f.write(f"{sp}: images/{sp}\n")
         f.write("names:\n")
         for k, (n, _, _) in enumerate(cls):
