@@ -1,0 +1,2212 @@
+{
+ "images_root": "/workspaces/vrb/handover_masks/Images",
+ "labels_root": "/workspaces/vrb/handover_masks/Labels",
+ "point_names": [
+  "head",
+  "tail",
+  "middle",
+  "head_1_3",
+  "tail_1_3"
+ ],
+ "point_fracs_from_head": [
+  0.0,
+  1.0,
+  0.5,
+  0.3333333333333333,
+  0.6666666666666666
+ ],
+ "thread_class": null,
+ "coordinate_convention": "points: x/W, y/H；points_px: 原圖 pixel",
+ "samples": [
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_01_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_01_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     542.8,
+     251.24
+    ],
+    [
+     654.76,
+     233.8
+    ],
+    [
+     603.11,
+     269.96
+    ],
+    [
+     581.65,
+     269.38
+    ],
+    [
+     623.63,
+     263.42
+    ]
+   ],
+   "points": [
+    [
+     0.424066,
+     0.34895
+    ],
+    [
+     0.511528,
+     0.324729
+    ],
+    [
+     0.47118,
+     0.374939
+    ],
+    [
+     0.45441,
+     0.374137
+    ],
+    [
+     0.48721,
+     0.365865
+    ]
+   ],
+   "needle_bbox": [
+    542.8,
+    233.8,
+    657.0,
+    275.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 130.6,
+   "n_fragments": 2,
+   "bridged_gap_px": 16.0,
+   "fit_model": "circle",
+   "straightness": 0.867
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_02_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_02_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     540.66,
+     199.07
+    ],
+    [
+     657.93,
+     213.66
+    ],
+    [
+     595.63,
+     238.33
+    ],
+    [
+     573.33,
+     232.09
+    ],
+    [
+     618.72,
+     238.11
+    ]
+   ],
+   "points": [
+    [
+     0.422389,
+     0.276491
+    ],
+    [
+     0.514005,
+     0.296748
+    ],
+    [
+     0.465336,
+     0.331008
+    ],
+    [
+     0.447916,
+     0.322351
+    ],
+    [
+     0.483376,
+     0.330711
+    ]
+   ],
+   "needle_bbox": [
+    540.0,
+    198.0,
+    660.0,
+    243.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 140.8,
+   "n_fragments": 2,
+   "bridged_gap_px": 25.0,
+   "fit_model": "circle",
+   "straightness": 0.839
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_03_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_03_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     542.74,
+     145.56
+    ],
+    [
+     656.5,
+     162.5
+    ],
+    [
+     595.3,
+     187.46
+    ],
+    [
+     573.11,
+     180.43
+    ],
+    [
+     618.41,
+     187.92
+    ]
+   ],
+   "points": [
+    [
+     0.424012,
+     0.202165
+    ],
+    [
+     0.512891,
+     0.225694
+    ],
+    [
+     0.465078,
+     0.260361
+    ],
+    [
+     0.447743,
+     0.250593
+    ],
+    [
+     0.483134,
+     0.260997
+    ]
+   ],
+   "needle_bbox": [
+    541.0,
+    145.6,
+    659.0,
+    192.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 140.2,
+   "n_fragments": 2,
+   "bridged_gap_px": 33.5,
+   "fit_model": "circle",
+   "straightness": 0.82
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_04_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_04_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     532.86,
+     172.66
+    ],
+    [
+     656.32,
+     191.15
+    ],
+    [
+     590.28,
+     217.6
+    ],
+    [
+     566.14,
+     209.86
+    ],
+    [
+     615.82,
+     216.27
+    ]
+   ],
+   "points": [
+    [
+     0.416298,
+     0.239799
+    ],
+    [
+     0.512748,
+     0.265481
+    ],
+    [
+     0.461159,
+     0.302222
+    ],
+    [
+     0.442299,
+     0.291468
+    ],
+    [
+     0.481113,
+     0.300375
+    ]
+   ],
+   "needle_bbox": [
+    531.0,
+    172.7,
+    658.0,
+    222.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 154.2,
+   "n_fragments": 2,
+   "bridged_gap_px": 8.8,
+   "fit_model": "circle",
+   "straightness": 0.809
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_05_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_05_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     637.38,
+     354.55
+    ],
+    [
+     747.69,
+     322.28
+    ],
+    [
+     701.49,
+     364.9
+    ],
+    [
+     679.62,
+     369.0
+    ],
+    [
+     722.09,
+     356.32
+    ]
+   ],
+   "points": [
+    [
+     0.497953,
+     0.492433
+    ],
+    [
+     0.584133,
+     0.447605
+    ],
+    [
+     0.548037,
+     0.506809
+    ],
+    [
+     0.530954,
+     0.5125
+    ],
+    [
+     0.564136,
+     0.494895
+    ]
+   ],
+   "needle_bbox": [
+    637.4,
+    322.0,
+    750.0,
+    372.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 134.8,
+   "n_fragments": 2,
+   "bridged_gap_px": 19.8,
+   "fit_model": "circle",
+   "straightness": 0.853
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_06_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_06_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     391.5,
+     211.5
+    ],
+    [
+     507.58,
+     184.12
+    ],
+    [
+     458.55,
+     237.45
+    ],
+    [
+     433.8,
+     238.0
+    ],
+    [
+     480.31,
+     225.69
+    ]
+   ],
+   "points": [
+    [
+     0.305859,
+     0.29375
+    ],
+    [
+     0.396544,
+     0.255716
+    ],
+    [
+     0.35824,
+     0.329795
+    ],
+    [
+     0.338902,
+     0.330556
+    ],
+    [
+     0.375243,
+     0.313457
+    ]
+   ],
+   "needle_bbox": [
+    391.0,
+    184.0,
+    510.0,
+    244.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 159.8,
+   "n_fragments": 1,
+   "bridged_gap_px": 0.0,
+   "fit_model": "single",
+   "straightness": 0.746
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_07_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_07_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     884.06,
+     292.24
+    ],
+    [
+     1021.95,
+     234.56
+    ],
+    [
+     965.81,
+     295.51
+    ],
+    [
+     938.64,
+     303.07
+    ],
+    [
+     989.25,
+     279.75
+    ]
+   ],
+   "points": [
+    [
+     0.690671,
+     0.405882
+    ],
+    [
+     0.798399,
+     0.325779
+    ],
+    [
+     0.754539,
+     0.410436
+    ],
+    [
+     0.733315,
+     0.420933
+    ],
+    [
+     0.772848,
+     0.388548
+    ]
+   ],
+   "needle_bbox": [
+    883.0,
+    233.0,
+    1023.0,
+    309.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 170.7,
+   "n_fragments": 2,
+   "bridged_gap_px": 21.6,
+   "fit_model": "circle",
+   "straightness": 0.876
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_08_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_08_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     464.1,
+     228.88
+    ],
+    [
+     672.5,
+     180.5
+    ],
+    [
+     582.91,
+     266.0
+    ],
+    [
+     539.21,
+     269.0
+    ],
+    [
+     620.57,
+     246.43
+    ]
+   ],
+   "points": [
+    [
+     0.362576,
+     0.317886
+    ],
+    [
+     0.525391,
+     0.250694
+    ],
+    [
+     0.455399,
+     0.369444
+    ],
+    [
+     0.421261,
+     0.373611
+    ],
+    [
+     0.484822,
+     0.34226
+    ]
+   ],
+   "needle_bbox": [
+    464.0,
+    180.0,
+    673.5,
+    275.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 274.6,
+   "n_fragments": 1,
+   "bridged_gap_px": 0.0,
+   "fit_model": "single",
+   "straightness": 0.779
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_09_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_09_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     578.0,
+     361.0
+    ],
+    [
+     821.2,
+     332.24
+    ],
+    [
+     703.23,
+     386.55
+    ],
+    [
+     659.64,
+     390.68
+    ],
+    [
+     745.63,
+     375.75
+    ]
+   ],
+   "points": [
+    [
+     0.451562,
+     0.501389
+    ],
+    [
+     0.641559,
+     0.46145
+    ],
+    [
+     0.549402,
+     0.536879
+    ],
+    [
+     0.515341,
+     0.542606
+    ],
+    [
+     0.582524,
+     0.521872
+    ]
+   ],
+   "needle_bbox": [
+    578.0,
+    331.0,
+    823.0,
+    394.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 263.6,
+   "n_fragments": 2,
+   "bridged_gap_px": 39.3,
+   "fit_model": "circle",
+   "straightness": 0.929
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_10_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_10_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     560.0,
+     304.0
+    ],
+    [
+     750.0,
+     258.0
+    ],
+    [
+     669.03,
+     333.59
+    ],
+    [
+     630.73,
+     337.68
+    ],
+    [
+     705.54,
+     319.77
+    ]
+   ],
+   "points": [
+    [
+     0.4375,
+     0.422222
+    ],
+    [
+     0.585938,
+     0.358333
+    ],
+    [
+     0.522677,
+     0.463326
+    ],
+    [
+     0.492756,
+     0.469006
+    ],
+    [
+     0.5512,
+     0.444127
+    ]
+   ],
+   "needle_bbox": [
+    560.0,
+    258.0,
+    755.0,
+    342.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 237.0,
+   "n_fragments": 2,
+   "bridged_gap_px": 26.8,
+   "fit_model": "circle",
+   "straightness": 0.825
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_11_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_11_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     622.72,
+     96.04
+    ],
+    [
+     757.66,
+     70.86
+    ],
+    [
+     698.14,
+     121.17
+    ],
+    [
+     671.03,
+     120.42
+    ],
+    [
+     723.49,
+     111.7
+    ]
+   ],
+   "points": [
+    [
+     0.4865,
+     0.133389
+    ],
+    [
+     0.591918,
+     0.09842
+    ],
+    [
+     0.545421,
+     0.168292
+    ],
+    [
+     0.524245,
+     0.167252
+    ],
+    [
+     0.56523,
+     0.155143
+    ]
+   ],
+   "needle_bbox": [
+    622.0,
+    70.9,
+    760.0,
+    125.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 164.1,
+   "n_fragments": 2,
+   "bridged_gap_px": 32.0,
+   "fit_model": "circle",
+   "straightness": 0.836
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_12_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_12_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     623.2,
+     95.76
+    ],
+    [
+     758.03,
+     70.41
+    ],
+    [
+     698.31,
+     120.0
+    ],
+    [
+     671.2,
+     120.71
+    ],
+    [
+     723.64,
+     111.09
+    ]
+   ],
+   "points": [
+    [
+     0.486871,
+     0.132995
+    ],
+    [
+     0.592214,
+     0.097797
+    ],
+    [
+     0.545554,
+     0.166667
+    ],
+    [
+     0.524375,
+     0.167652
+    ],
+    [
+     0.565344,
+     0.154288
+    ]
+   ],
+   "needle_bbox": [
+    623.0,
+    70.0,
+    761.0,
+    125.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 163.7,
+   "n_fragments": 2,
+   "bridged_gap_px": 19.8,
+   "fit_model": "circle",
+   "straightness": 0.838
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_13_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_13_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     397.56,
+     201.74
+    ],
+    [
+     497.49,
+     196.61
+    ],
+    [
+     448.35,
+     222.4
+    ],
+    [
+     429.67,
+     221.66
+    ],
+    [
+     466.81,
+     218.68
+    ]
+   ],
+   "points": [
+    [
+     0.310593,
+     0.280188
+    ],
+    [
+     0.388662,
+     0.273069
+    ],
+    [
+     0.350276,
+     0.308889
+    ],
+    [
+     0.335679,
+     0.307866
+    ],
+    [
+     0.364694,
+     0.303717
+    ]
+   ],
+   "needle_bbox": [
+    397.6,
+    196.0,
+    498.5,
+    225.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 114.1,
+   "n_fragments": 2,
+   "bridged_gap_px": 27.7,
+   "fit_model": "circle",
+   "straightness": 0.877
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_14_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_14_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     288.03,
+     337.62
+    ],
+    [
+     73.03,
+     384.41
+    ],
+    [
+     193.5,
+     413.7
+    ],
+    [
+     233.59,
+     400.64
+    ],
+    [
+     151.2,
+     415.39
+    ]
+   ],
+   "points": [
+    [
+     0.225023,
+     0.468913
+    ],
+    [
+     0.057058,
+     0.533908
+    ],
+    [
+     0.151173,
+     0.574583
+    ],
+    [
+     0.182494,
+     0.556451
+    ],
+    [
+     0.118127,
+     0.576936
+    ]
+   ],
+   "needle_bbox": [
+    73.0,
+    337.0,
+    289.0,
+    421.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 255.3,
+   "n_fragments": 2,
+   "bridged_gap_px": 50.2,
+   "fit_model": "circle",
+   "straightness": 0.862
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_15_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_15_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     625.03,
+     348.62
+    ],
+    [
+     438.34,
+     396.14
+    ],
+    [
+     545.28,
+     421.74
+    ],
+    [
+     580.16,
+     407.71
+    ],
+    [
+     507.8,
+     424.57
+    ]
+   ],
+   "points": [
+    [
+     0.488304,
+     0.484191
+    ],
+    [
+     0.342457,
+     0.550192
+    ],
+    [
+     0.425999,
+     0.585756
+    ],
+    [
+     0.453246,
+     0.56626
+    ],
+    [
+     0.396716,
+     0.589684
+    ]
+   ],
+   "needle_bbox": [
+    438.0,
+    348.0,
+    626.0,
+    430.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 227.6,
+   "n_fragments": 2,
+   "bridged_gap_px": 33.1,
+   "fit_model": "circle",
+   "straightness": 0.846
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_16_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_16_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     889.03,
+     133.62
+    ],
+    [
+     740.93,
+     167.17
+    ],
+    [
+     826.31,
+     192.34
+    ],
+    [
+     854.5,
+     181.9
+    ],
+    [
+     795.96,
+     192.04
+    ]
+   ],
+   "points": [
+    [
+     0.694554,
+     0.18558
+    ],
+    [
+     0.578852,
+     0.232184
+    ],
+    [
+     0.645554,
+     0.267136
+    ],
+    [
+     0.667575,
+     0.252643
+    ],
+    [
+     0.621842,
+     0.266721
+    ]
+   ],
+   "needle_bbox": [
+    740.9,
+    133.0,
+    891.0,
+    197.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 182.8,
+   "n_fragments": 2,
+   "bridged_gap_px": 26.1,
+   "fit_model": "circle",
+   "straightness": 0.831
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_17_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_17_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     717.5,
+     82.5
+    ],
+    [
+     607.94,
+     103.76
+    ],
+    [
+     669.07,
+     125.0
+    ],
+    [
+     689.07,
+     116.15
+    ],
+    [
+     646.96,
+     124.71
+    ]
+   ],
+   "points": [
+    [
+     0.560547,
+     0.114583
+    ],
+    [
+     0.474954,
+     0.144118
+    ],
+    [
+     0.522711,
+     0.173611
+    ],
+    [
+     0.538333,
+     0.161315
+    ],
+    [
+     0.505437,
+     0.173202
+    ]
+   ],
+   "needle_bbox": [
+    607.9,
+    82.0,
+    718.5,
+    129.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 133.8,
+   "n_fragments": 2,
+   "bridged_gap_px": 33.0,
+   "fit_model": "circle",
+   "straightness": 0.834
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_18_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_18_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     568.58,
+     262.12
+    ],
+    [
+     431.91,
+     292.15
+    ],
+    [
+     508.88,
+     314.82
+    ],
+    [
+     535.04,
+     305.18
+    ],
+    [
+     481.11,
+     316.53
+    ]
+   ],
+   "points": [
+    [
+     0.444201,
+     0.364049
+    ],
+    [
+     0.337431,
+     0.40576
+    ],
+    [
+     0.39756,
+     0.437256
+    ],
+    [
+     0.418,
+     0.423856
+    ],
+    [
+     0.375869,
+     0.439621
+    ]
+   ],
+   "needle_bbox": [
+    431.0,
+    262.0,
+    571.0,
+    320.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 168.4,
+   "n_fragments": 2,
+   "bridged_gap_px": 29.6,
+   "fit_model": "circle",
+   "straightness": 0.831
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_19_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_19_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     1029.88,
+     84.58
+    ],
+    [
+     890.86,
+     147.34
+    ],
+    [
+     976.43,
+     152.54
+    ],
+    [
+     1001.06,
+     135.94
+    ],
+    [
+     947.87,
+     161.29
+    ]
+   ],
+   "points": [
+    [
+     0.804597,
+     0.117468
+    ],
+    [
+     0.695986,
+     0.204646
+    ],
+    [
+     0.762837,
+     0.211863
+    ],
+    [
+     0.782078,
+     0.188806
+    ],
+    [
+     0.74052,
+     0.224008
+    ]
+   ],
+   "needle_bbox": [
+    890.9,
+    84.6,
+    1034.0,
+    165.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 180.1,
+   "n_fragments": 2,
+   "bridged_gap_px": 28.2,
+   "fit_model": "circle",
+   "straightness": 0.847
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_20_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_20_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     627.69,
+     97.28
+    ],
+    [
+     530.79,
+     124.68
+    ],
+    [
+     587.24,
+     140.55
+    ],
+    [
+     605.42,
+     131.07
+    ],
+    [
+     566.75,
+     143.23
+    ]
+   ],
+   "points": [
+    [
+     0.490383,
+     0.135105
+    ],
+    [
+     0.414683,
+     0.173162
+    ],
+    [
+     0.458778,
+     0.195212
+    ],
+    [
+     0.472983,
+     0.182036
+    ],
+    [
+     0.442773,
+     0.198931
+    ]
+   ],
+   "needle_bbox": [
+    530.0,
+    97.0,
+    630.0,
+    148.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 124.8,
+   "n_fragments": 2,
+   "bridged_gap_px": 23.6,
+   "fit_model": "circle",
+   "straightness": 0.807
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_21_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_21_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     897.77,
+     82.15
+    ],
+    [
+     774.9,
+     130.76
+    ],
+    [
+     849.01,
+     138.0
+    ],
+    [
+     871.61,
+     125.44
+    ],
+    [
+     823.95,
+     143.37
+    ]
+   ],
+   "points": [
+    [
+     0.701382,
+     0.114103
+    ],
+    [
+     0.605388,
+     0.181609
+    ],
+    [
+     0.663288,
+     0.191662
+    ],
+    [
+     0.680943,
+     0.174216
+    ],
+    [
+     0.643712,
+     0.199129
+    ]
+   ],
+   "needle_bbox": [
+    774.9,
+    82.0,
+    901.0,
+    147.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 156.3,
+   "n_fragments": 2,
+   "bridged_gap_px": 21.3,
+   "fit_model": "circle",
+   "straightness": 0.846
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_22_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_22_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     457.38,
+     144.08
+    ],
+    [
+     358.0,
+     186.0
+    ],
+    [
+     420.75,
+     199.55
+    ],
+    [
+     438.41,
+     185.24
+    ],
+    [
+     398.72,
+     203.9
+    ]
+   ],
+   "points": [
+    [
+     0.357332,
+     0.200107
+    ],
+    [
+     0.279688,
+     0.258333
+    ],
+    [
+     0.328711,
+     0.277153
+    ],
+    [
+     0.342505,
+     0.257281
+    ],
+    [
+     0.311502,
+     0.283196
+    ]
+   ],
+   "needle_bbox": [
+    355.0,
+    144.0,
+    460.0,
+    209.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 137.3,
+   "n_fragments": 2,
+   "bridged_gap_px": 44.9,
+   "fit_model": "circle",
+   "straightness": 0.786
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_23_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_23_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     739.59,
+     240.97
+    ],
+    [
+     635.97,
+     190.41
+    ],
+    [
+     672.36,
+     247.35
+    ],
+    [
+     694.68,
+     254.28
+    ],
+    [
+     653.46,
+     233.46
+    ]
+   ],
+   "points": [
+    [
+     0.577802,
+     0.334674
+    ],
+    [
+     0.496848,
+     0.264464
+    ],
+    [
+     0.525284,
+     0.343535
+    ],
+    [
+     0.542719,
+     0.353172
+    ],
+    [
+     0.510518,
+     0.324253
+    ]
+   ],
+   "needle_bbox": [
+    636.0,
+    190.0,
+    741.0,
+    258.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 142.0,
+   "n_fragments": 2,
+   "bridged_gap_px": 25.5,
+   "fit_model": "circle",
+   "straightness": 0.812
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_24_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_24_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     886.76,
+     175.8
+    ],
+    [
+     775.31,
+     173.28
+    ],
+    [
+     828.51,
+     210.0
+    ],
+    [
+     851.13,
+     205.04
+    ],
+    [
+     805.67,
+     206.8
+    ]
+   ],
+   "points": [
+    [
+     0.692778,
+     0.244173
+    ],
+    [
+     0.605711,
+     0.240661
+    ],
+    [
+     0.647273,
+     0.291667
+    ],
+    [
+     0.664947,
+     0.284773
+    ],
+    [
+     0.629432,
+     0.287228
+    ]
+   ],
+   "needle_bbox": [
+    773.0,
+    173.0,
+    889.0,
+    214.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 139.8,
+   "n_fragments": 2,
+   "bridged_gap_px": 29.8,
+   "fit_model": "circle",
+   "straightness": 0.797
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_25_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_25_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     658.68,
+     103.85
+    ],
+    [
+     572.62,
+     95.08
+    ],
+    [
+     613.49,
+     125.0
+    ],
+    [
+     631.53,
+     124.69
+    ],
+    [
+     596.39,
+     120.23
+    ]
+   ],
+   "points": [
+    [
+     0.514596,
+     0.144241
+    ],
+    [
+     0.447356,
+     0.132051
+    ],
+    [
+     0.479286,
+     0.173611
+    ],
+    [
+     0.493387,
+     0.173187
+    ],
+    [
+     0.465929,
+     0.166991
+    ]
+   ],
+   "needle_bbox": [
+    569.0,
+    95.0,
+    659.7,
+    130.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 108.3,
+   "n_fragments": 2,
+   "bridged_gap_px": 12.8,
+   "fit_model": "circle",
+   "straightness": 0.799
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_26_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_26_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     950.0,
+     385.0
+    ],
+    [
+     792.32,
+     381.21
+    ],
+    [
+     869.25,
+     420.0
+    ],
+    [
+     899.17,
+     416.88
+    ],
+    [
+     839.48,
+     416.3
+    ]
+   ],
+   "points": [
+    [
+     0.742188,
+     0.534722
+    ],
+    [
+     0.619003,
+     0.529453
+    ],
+    [
+     0.679105,
+     0.583333
+    ],
+    [
+     0.702477,
+     0.579004
+    ],
+    [
+     0.655842,
+     0.578188
+    ]
+   ],
+   "needle_bbox": [
+    790.0,
+    381.0,
+    951.0,
+    424.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 181.5,
+   "n_fragments": 2,
+   "bridged_gap_px": 26.3,
+   "fit_model": "circle",
+   "straightness": 0.869
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_27_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_27_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     502.93,
+     381.66
+    ],
+    [
+     359.17,
+     331.93
+    ],
+    [
+     420.79,
+     392.11
+    ],
+    [
+     449.27,
+     398.8
+    ],
+    [
+     396.19,
+     376.55
+    ]
+   ],
+   "points": [
+    [
+     0.392912,
+     0.530081
+    ],
+    [
+     0.280603,
+     0.461015
+    ],
+    [
+     0.32874,
+     0.544604
+    ],
+    [
+     0.35099,
+     0.553895
+    ],
+    [
+     0.30952,
+     0.522985
+    ]
+   ],
+   "needle_bbox": [
+    357.0,
+    331.9,
+    505.0,
+    402.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 176.2,
+   "n_fragments": 2,
+   "bridged_gap_px": 31.5,
+   "fit_model": "circle",
+   "straightness": 0.863
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_28_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_28_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     1061.45,
+     432.62
+    ],
+    [
+     924.24,
+     411.1
+    ],
+    [
+     986.29,
+     454.0
+    ],
+    [
+     1012.95,
+     453.94
+    ],
+    [
+     960.08,
+     448.63
+    ]
+   ],
+   "points": [
+    [
+     0.829256,
+     0.600862
+    ],
+    [
+     0.722064,
+     0.570977
+    ],
+    [
+     0.770537,
+     0.630556
+    ],
+    [
+     0.791369,
+     0.630473
+    ],
+    [
+     0.750062,
+     0.6231
+    ]
+   ],
+   "needle_bbox": [
+    922.0,
+    411.0,
+    1063.0,
+    458.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 161.3,
+   "n_fragments": 2,
+   "bridged_gap_px": 30.4,
+   "fit_model": "circle",
+   "straightness": 0.861
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_29_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_29_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     629.62,
+     107.03
+    ],
+    [
+     533.97,
+     57.41
+    ],
+    [
+     569.64,
+     108.78
+    ],
+    [
+     589.52,
+     116.16
+    ],
+    [
+     553.7,
+     94.62
+    ]
+   ],
+   "points": [
+    [
+     0.491889,
+     0.148652
+    ],
+    [
+     0.417161,
+     0.079741
+    ],
+    [
+     0.445031,
+     0.151089
+    ],
+    [
+     0.460559,
+     0.161334
+    ],
+    [
+     0.432574,
+     0.131415
+    ]
+   ],
+   "needle_bbox": [
+    533.0,
+    57.0,
+    631.0,
+    120.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 128.4,
+   "n_fragments": 2,
+   "bridged_gap_px": 18.6,
+   "fit_model": "circle",
+   "straightness": 0.839
+  },
+  {
+   "image": "cam_260422273204_handover_20261115/calibration_30_rgb.png",
+   "mask": "cam_260422273204_handover_20261115/calibration_30_rgb.png",
+   "split": "train",
+   "needle_id": 0,
+   "width": 1280,
+   "height": 720,
+   "point_names": [
+    "head",
+    "tail",
+    "middle",
+    "head_1_3",
+    "tail_1_3"
+   ],
+   "points_px": [
+    [
+     563.0,
+     271.0
+    ],
+    [
+     402.5,
+     221.5
+    ],
+    [
+     473.48,
+     283.69
+    ],
+    [
+     504.45,
+     290.55
+    ],
+    [
+     445.52,
+     268.42
+    ]
+   ],
+   "points": [
+    [
+     0.439844,
+     0.376389
+    ],
+    [
+     0.314453,
+     0.307639
+    ],
+    [
+     0.369906,
+     0.394011
+    ],
+    [
+     0.394105,
+     0.403542
+    ],
+    [
+     0.348066,
+     0.372805
+    ]
+   ],
+   "needle_bbox": [
+    402.0,
+    221.5,
+    564.0,
+    293.0
+   ],
+   "head_confirmed": true,
+   "head_source": "manual",
+   "thread_dist_px": null,
+   "length_px": 192.1,
+   "n_fragments": 2,
+   "bridged_gap_px": 34.2,
+   "fit_model": "circle",
+   "straightness": 0.874
+  }
+ ]
+}

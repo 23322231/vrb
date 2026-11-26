@@ -1,0 +1,5 @@
+path: /workspaces/vrb/needle_yolo_seg_needle
+train: images/train
+val: images/val
+names:
+  0: needle

@@ -1,0 +1,25 @@
+{
+ "frames_dir": "/workspaces/vrb/handover_live_frames/handover_20261119_test_right",
+ "frames": [
+  "000001_1795086417.053007603.png",
+  "000002_1795087140.449947119.png"
+ ],
+ "stride": 1,
+ "obj_ids": [
+  1
+ ],
+ "obj_cls": {
+  "1": "needle"
+ },
+ "excluded": [],
+ "trusted": {
+  "0": [
+   1
+  ],
+  "1": [
+   1
+  ]
+ },
+ "points": {},
+ "boxes": {}
+}

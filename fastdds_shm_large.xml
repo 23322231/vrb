@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Handover 對話 B：給「假相機」handover_pub_images.py 用的 FastDDS 設定（共享記憶體 SHM，segment 64 MB）。
+
+  為什麼需要：FastDDS 預設的 SHM segment 只有 512 KB，1280x720 rgb8 一張 2.7 MB 放不進去，
+  就會改走 UDP、切成上千個封包；node 訂閱影像用 best-effort（sensor_data QoS），
+  只要掉一個封包整張就丟，結果 10 Hz 發送、實際只收到不到 1 Hz（等不到影像 → no_image）。
+  真的 EtH 相機已經實測可收到 15 Hz，不需要這個檔；這只給發送端（假相機）用。
+
+  用法（只在發送端的終端機設定；node 與 client 不用設）：
+      export FASTRTPS_DEFAULT_PROFILES_FILE=/workspaces/vrb/fastdds_shm_large.xml
+      python handover_pub_images.py ...
+  同一台主機、ipc=host 時 SHM 才有效；UDP 留著當備援（讓別台機器也找得到）。
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>shm_large</transport_id>
+      <type>SHM</type>
+      <segment_size>67108864</segment_size>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>udp_big_buf</transport_id>
+      <type>UDPv4</type>
+      <sendBufferSize>8388608</sendBufferSize>
+      <receiveBufferSize>8388608</receiveBufferSize>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="shm_large_participant" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>shm_large</transport_id>
+        <transport_id>udp_big_buf</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

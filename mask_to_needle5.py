@@ -531,7 +531,7 @@ def render_task(rgb, nd, dec, title, view=720, pad=120, r=3, suggest=None, sug_s
               None: "not decided"}.get(dec, str(dec))
     color = (0, 255, 255) if dec else (180, 180, 180)
     if dec is None and suggest in ("A", "B"):
-        src = {"thread": "by THREAD", "temporal": "from nearby frames"}.get(sug_src, "")
+        src = {"thread": "by THREAD", "temporal": "from nearby frames", "left": "by LEFT-END rule"}.get(sug_src, "")
         status = f"SUGGESTED HEAD = {'1 (green)' if suggest == 'A' else '2 (magenta)'} {src} -> SPACE to accept"
         color = (0, 220, 120) if sug_src == "thread" else (0, 165, 255)
     bar = np.zeros((26 * (len(HELP_LINES) + 2), canvas.shape[1], 3), np.uint8)
@@ -541,6 +541,11 @@ def render_task(rgb, nd, dec, title, view=720, pad=120, r=3, suggest=None, sug_s
         cv2.putText(bar, t, (8, 22 + 26 * (j + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (255, 255, 255), 1, cv2.LINE_AA)
     return np.vstack([canvas, bar])
+
+
+def left_end(nd):
+    """「針頭在畫面左邊」規則：中心線 x 較小的一端是針頭（handover 流程固定針頭朝左）。回傳 'A' / 'B'。"""
+    return "A" if nd["poly"][0][0] <= nd["poly"][-1][0] else "B"
 
 
 def suggest_head(tasks, i, decisions, window=30, max_jump=150.0, min_margin=0.25):
@@ -578,7 +583,7 @@ def suggest_head(tasks, i, decisions, window=30, max_jump=150.0, min_margin=0.25
 
 
 def run_ui(tasks, rgb_loader, decisions, dec_path, goto=None, review=False, use_suggest=True,
-           auto=None, visit=None, tmask_loader=None):
+           auto=None, visit=None, tmask_loader=None, suggest_rule="none"):
     """tasks: [(key, rel, nd)]。可前後翻頁，每次決定立即存檔（已標過的也可以重按 1 / 2 / b 覆蓋）。
     auto：依線自動判斷的 {key: 'A'/'B'}（顯示成建議，空白鍵接受 = 變成人工決定）
     visit：要逐一確認的 key 集合（None = 全部）；n / p 翻頁只在這些針之間移動。
@@ -616,6 +621,8 @@ def run_ui(tasks, rgb_loader, decisions, dec_path, goto=None, review=False, use_
         if decisions.get(key) is None:
             if key in auto:
                 sug, src = auto[key], "thread"
+            elif suggest_rule == "left":
+                sug, src = left_end(nd), "left"
             elif use_suggest:
                 sug = suggest_head(tasks, i, {**auto, **decisions})
                 src = "temporal" if sug else None
@@ -705,6 +712,11 @@ def main():
                          "給了 --goto 時線已判斷好的針也會顯示，可以直接按 1 / 2 改")
     ap.add_argument("--review", action="store_true", help="互動模式從第 1 根針開始（檢查 / 修改已標過的）")
     ap.add_argument("--no_suggest", action="store_true", help="關閉「依前後影格自動建議針頭」")
+    ap.add_argument("--suggest_rule", choices=["none", "left"], default="none",
+                    help="left：互動時預設建議「畫面左邊那一端是針頭」（handover 流程針頭朝左），空白鍵接受，優先於前後影格建議")
+    ap.add_argument("--auto_rule", choices=["none", "left"], default="none",
+                    help="left：沒有人工決定、也沒有線判斷的針，直接用「左端 = 針頭」當決定輸出（不開視窗也會進訓練，"
+                         "來源記為 left_rule）。人工決定永遠優先")
     ap.add_argument("--thread_name", default="thread", help="color.txt 裡線的類別名稱（沒有這個類別就不用線判斷）")
     ap.add_argument("--no_thread", action="store_true", help="不用線自動判斷頭尾")
     ap.add_argument("--thread_touch", type=float, default=15,
@@ -750,7 +762,7 @@ def main():
 
     # 1) 先算所有針的幾何
     stats = {"no_needle": 0, "too_short": 0, "fragmented": 0, "bad": 0, "unconfirmed": 0}
-    src_count = {"manual": 0, "thread": 0}
+    src_count = {"manual": 0, "thread": 0, "left_rule": 0}
     auto, auto_info = {}, {}                                  # 線判斷：{key: 'A'/'B'}、{key: 細節}
     t_reason = {"ok": 0, "thread_far": 0, "ambiguous": 0, "no_thread_class": 0, "no_thread_pixels": 0}
     fragmented = []
@@ -828,7 +840,7 @@ def main():
             run_ui(tasks, lambda rel: cv2.imread(os.path.join(args.images_dir, rel)), decisions, dec_path,
                    goto=args.goto, review=args.review, use_suggest=not args.no_suggest, auto=auto, visit=visit,
                    tmask_loader=(lambda rel: thread_mask_of(cv2.imread(mpath_of[rel], cv2.IMREAD_UNCHANGED)))
-                   if tinfo is not None else None)
+                   if tinfo is not None else None, suggest_rule=args.suggest_rule)
         except KeyboardInterrupt:
             cv2.destroyAllWindows()
             print(f"\n[中斷] 頭尾決定已存在 {dec_path}；annotations.json 沒有重寫（之後用 --mode auto 重跑即可輸出）")
@@ -851,6 +863,8 @@ def main():
             source = "manual" if dec in ("A", "B") else None
             if dec is None and key in auto:
                 dec, source = auto[key], "thread"
+            elif dec is None and args.auto_rule == "left":
+                dec, source = left_end(nd), "left_rule"
             if dec == "bad":
                 stats["bad"] += 1
                 continue
@@ -920,7 +934,7 @@ def main():
     by_split = {s: sum(x["split"] == s for x in samples) for s in ("train", "val", "test")}
     print(f"\n完成：{len(samples)} 根針 {by_split}")
     print(f"  略過：{stats}")
-    print(f"  頭尾來源：人工 {src_count['manual']}、線 {src_count['thread']}")
+    print(f"  頭尾來源：人工 {src_count['manual']}、線 {src_count['thread']}、左端規則 {src_count['left_rule']}")
     if stats["unconfirmed"]:
         print("  [NOTE] 有頭尾尚未確認的針（head_confirmed=false），請用 --mode interactive 標完再拿去訓練")
     print(f"  → {os.path.join(args.out_dir, 'annotations.json')}")

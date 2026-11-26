@@ -63,7 +63,9 @@ sys.path.insert(0, _HERE)
 
 # 2026-11-17 起的 handover 模型（舊的：runs/segment/train/weights/best.pt、runs/ablation_v2/p5_both_seg1_paper_pre_20261024_180740）
 DEFAULT_YOLO = os.path.join(_HERE, "runs/needle_seg/best_20261116_225446/weights/best.pt")
-DEFAULT_RUN = os.path.join(_HERE, "runs/handover_v3/needle5_20261116_205018")
+DEFAULT_RUN = os.path.join(_HERE, "runs/handover_v4/handover_v4/needle5_20261124_161947")
+# handover_v4/handover_v4/needle5_20261123_174758 作廢：訓練指令漏了 --contact_weight 1 --hm_weight 0.1 --seg_weight 0.5，
+# --paper 1 把 heatmap loss 與 seg 都關掉，heatmap 沒有學成尖峰。重訓好之後再改這裡
 DEFAULT_VRB_WEIGHTS = "model_best.pth.tar"
 # build_needle5_aug.py 建 needle5_thread_aug 時用的裁切參數（annotations.json 的 build_args）
 TRAIN_CROP = types.SimpleNamespace(box_pad=20.0, box_pad_ratio=0.15, min_side=96.0)

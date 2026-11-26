@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Handover 對話 B：FastDDS 只用 UDP（不用共享記憶體 SHM / data sharing）。
+  兩個 container 的使用者 UID 不同時，SHM 的檔案權限可能讓訂閱端收不到影像；改走 UDP 就沒有這個問題
+  （同一台主機、network=host，1280x720 rgb8 30 Hz 約 80 MB/s，loopback 沒問題）。
+
+  用法（訂閱端；若 publisher 端的 profile 「只」開 SHM，publisher 那邊也要用這個或加上 UDP transport）：
+      export FASTRTPS_DEFAULT_PROFILES_FILE=/workspaces/vrb/fastdds_udp_only.xml
+      export RMW_FASTRTPS_USE_QOS_FROM_XML=0
+      python handover_perception_node.py ...
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_only</transport_id>
+      <type>UDPv4</type>
+      <sendBufferSize>8388608</sendBufferSize>
+      <receiveBufferSize>8388608</receiveBufferSize>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="udp_only_participant" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_only</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

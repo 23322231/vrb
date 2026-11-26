@@ -22,3 +22,16 @@ pred_handoff_output/
 *.pt
 
 *.cache
+# handover 對話 C：FoundationStereo（NVIDIA 非商用授權，不可進公開 repo）與深度量測錄影
+third_party/
+captures/
+# 模型預測結果
+/workspaces/vrb/pred_handoff_output
+/workspaces/vrb/pred_needle5_output/20261102_203924
+
+
+# 訓練dataset
+/workspaces/vrb/handover_live_frames
+/workspaces/vrb/handover_live_masks
+/workspaces/vrb/handover_masks
+/workspaces/vrb/handover_train_masks

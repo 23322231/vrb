@@ -1,0 +1,52 @@
+{
+ "image": "/workspaces/vrb/my_needle_thread/Images/cam_260422273204_002901_1792135221.635050781/003711_1792135275.623999512.png",
+ "text": "needle",
+ "langsam_box": [
+  382.7,
+  0.2,
+  719.6,
+  289.6
+ ],
+ "langsam_score": 0.557233989238739,
+ "n_boxes": 2,
+ "crop_ltrb": [
+  385,
+  0,
+  718,
+  309
+ ],
+ "crop_wh": [
+  333,
+  309
+ ],
+ "points": {
+  "head": [
+   517.1,
+   83.0
+  ],
+  "tail": [
+   711.4,
+   179.3
+  ],
+  "middle": [
+   479.0,
+   110.4
+  ],
+  "head_1_3": [
+   491.5,
+   106.0
+  ],
+  "tail_1_3": [
+   487.9,
+   111.9
+  ]
+ },
+ "confidence": {
+  "head": 0.3,
+  "tail": 0.008,
+  "middle": 0.08,
+  "head_1_3": 0.298,
+  "tail_1_3": 0.108
+ },
+ "all_confident": false
+}

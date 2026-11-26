@@ -277,7 +277,7 @@ class VRBModel(nn.Module):
 
     def r3m_forward(self, img): 
         preprocess = nn.Sequential(nn.Identity())
-        obs = img.float()
+        obs = img.float() # 將影像轉成float
         obs_p = preprocess(obs)
         h = self.r3m.convnet(obs_p)
         return h

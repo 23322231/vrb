@@ -18,6 +18,18 @@ Handover 對話 B：感知服務 ROS 2 node（VRB container）。介面照 claud
     python handover_perception_node.py                                  # 預設就是 A 的 EtH 相機
     # 例：-p roi:="[300.0,100.0,1000.0,650.0]"
 
+    # 實機 handover（11-26 起）：看針的影像由 handover_node 挑一組（color + 同一時刻的左右 IR）以 reliable 轉發，
+    # camera_info 照樣訂閱相機的。深度用 FoundationStereo（fs）
+    export FASTRTPS_DEFAULT_PROFILES_FILE=/workspaces/vrb/fastdds_shm_large.xml   # 選用：讓 needle_debug 疊圖走 SHM（只影響 rqt 觀看）
+    python handover_perception_node.py --ros-args \
+      -p image_topic:=handover/predict_image \
+      -p infra1_topic:=handover/predict_infra1 -p infra2_topic:=handover/predict_infra2 \
+      -p infra1_info_topic:=arm/camera_eth/realsense_camera_eth/infra1/camera_info \
+      -p infra2_info_topic:=arm/camera_eth/realsense_camera_eth/infra2/camera_info \
+      -p color_info_topic:=arm/camera_eth/realsense_camera_eth/color/camera_info \
+      -p input_reliable:=true -p depth_backend:=fs
+    # 確認：ros2 topic info -v handover/predict_image（publisher 與 subscriber 的 Reliability 都要是 RELIABLE；infra1/2 同）
+
     # 另一個終端機測試
     ros2 service call handover/predict_needle std_srvs/srv/Trigger
     python handover_call_predict.py --n 20                     # 量延遲與重複性
@@ -40,7 +52,14 @@ Handover 對話 B：感知服務 ROS 2 node（VRB container）。介面照 claud
     publish_debug       是否發布疊圖 topic
     depth_backend       ""（預設，xyz_cam 一律 null）/ "fs" / "ffs" / "sgbm"：接 C 的 handover_depth.StereoDepth
                         需要 infra1_topic、infra2_topic、infra1_info_topic、infra2_info_topic、color_info_topic
-                        ※ 深度這段還沒在實機測過，接合由統籌與 C 確認
+    input_reliable      false（預設，和以前一樣 best effort，可直接訂閱相機原始 topic）/ true：image_topic、infra1_topic、
+                        infra2_topic 改用 RELIABLE + VOLATILE + KEEP_LAST 5（訂閱 handover/predict_* 時用）。
+                        ※ reliable 訂閱者收不到 best effort 發布者（相機原始 topic），所以只在訂閱 handover_node 轉發時打開。
+                        camera_info 一律 qos_profile_sensor_data
+    ir_max_dt           IR 與 color 時間戳最大差（預設 0.02 s）
+    ir_wait             收到 color 後最多再等 IR 幾秒（預設 0.3）：等緩衝區出現「infra1、infra2 時間戳相同，且和 color 差
+                        ≤ ir_max_dt」的一組；YOLO／VRB 推論期間就在等，所以 IR 晚到 0.1 s 通常不會多花時間。
+                        沒開深度（depth_backend 空、或 camera_info 還沒到）時完全不等
 """
 
 import array
@@ -57,7 +76,7 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -143,6 +162,12 @@ class HandoverPerceptionNode(Node):
                             p("infra2_info_topic", "arm/camera_eth/realsense_camera_eth/infra2/camera_info").value,
                             p("color_info_topic", "arm/camera_eth/realsense_camera_eth/color/camera_info").value]
         self.ir_max_dt = float(p("ir_max_dt", 0.02).value)
+        self.ir_wait = float(p("ir_wait", 0.3).value)
+        self.input_reliable = bool(p("input_reliable", False).value)
+        # 影像與 IR 的訂閱 QoS：預設 best effort（同以前）；input_reliable=true 時改 reliable（handover_node 的轉發是 reliable）
+        self.img_qos = (QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE,
+                                   history=HistoryPolicy.KEEP_LAST, depth=5)
+                        if self.input_reliable else qos_profile_sensor_data)
 
         t = time.perf_counter()
         self.perc = HP.NeedlePerception(yolo_w, run, vw, imgsz, conf, box_src=box_src, crop_mode=crop_mode,
@@ -160,14 +185,16 @@ class HandoverPerceptionNode(Node):
         self.depth_err = ""
 
         g_img, g_srv = MutuallyExclusiveCallbackGroup(), MutuallyExclusiveCallbackGroup()
-        self.create_subscription(Image, self.image_topic, self.on_image, qos_profile_sensor_data, callback_group=g_img)
+        self.create_subscription(Image, self.image_topic, self.on_image, self.img_qos, callback_group=g_img)
         self.pub_res = self.create_publisher(String, "handover/needle_result", 10)
         self.pub_dbg = self.create_publisher(Image, "handover/needle_debug", 1) if self.publish_debug else None
         if depth_backend:
             self._setup_depth(depth_backend, g_img)
         self.create_service(Trigger, "handover/predict_needle", self.on_predict, callback_group=g_srv)
         self.get_logger().info(f"服務 handover/predict_needle 就緒；訂閱 {self.image_topic}"
-                               + (f"；深度 {depth_backend}" if depth_backend else "；xyz_cam = null（沒開深度）"))
+                               f"（{'RELIABLE' if self.input_reliable else 'best effort'}）"
+                               + (f"；深度 {depth_backend}，IR {self.ir_topics}，IR 最多等 {self.ir_wait}s、"
+                                  f"時間差 ≤ {self.ir_max_dt * 1e3:.0f} ms" if depth_backend else "；xyz_cam = null（沒開深度）"))
         self.create_timer(5.0, self._warn_no_image, callback_group=g_img)
 
     # ------------------------------------------------------------------ 影像
@@ -199,13 +226,14 @@ class HandoverPerceptionNode(Node):
             self.get_logger().error(self.depth_err)
             return
         for i, tp in enumerate(self.ir_topics):
-            self.create_subscription(Image, tp, lambda m, i=i: self._on_ir(i, m), qos_profile_sensor_data, callback_group=group)
+            self.create_subscription(Image, tp, lambda m, i=i: self._on_ir(i, m), self.img_qos, callback_group=group)
         for i, tp in enumerate(self.info_topics):
             self.create_subscription(CameraInfo, tp, lambda m, i=i: self._on_info(i, m), qos_profile_sensor_data, callback_group=group)
 
     def _on_ir(self, i, msg):
         with self.cv:
             self.ir[i] = (self.ir[i] + [(stamp_sec(msg.header.stamp), msg)])[-10:]
+            self.cv.notify_all()                                   # 叫醒正在等 IR 的深度配對
 
     def _on_info(self, i, msg):
         self.infos[i] = msg
@@ -216,24 +244,47 @@ class HandoverPerceptionNode(Node):
             self.depth = self._StereoDepth(self._backend, D405Calib.from_camera_info(self.infos[0], self.infos[1], self.infos[2]))
             self.get_logger().info("深度模組就緒（camera_info 已收到）")
 
-    def _depth_fn_for(self, color_msg):
+    def _ir_match(self, ts):
+        """IR 緩衝區裡和 color 時間戳 ts 最接近的一組 (dt, m1, m2)（infra1、infra2 時間戳差 < 1 ms）；沒有成對的回 None。
+        呼叫時要持有 self.cv。"""
+        best = None
+        for s1, m1 in self.ir[0]:
+            for s2, m2 in self.ir[1]:
+                if abs(s1 - s2) < 1e-3:
+                    dt = abs(s1 - ts)
+                    if best is None or dt < best[0]:
+                        best = (dt, m1, m2)
+        return best
+
+    def _wait_ir(self, ts, deadline):
+        """等到 IR 緩衝區有「和 color 差 ≤ ir_max_dt」的一組，或到 deadline（time.time()）為止。
+        回傳 (m1, m2, "") 或 (None, None, 錯誤原因)。"""
+        with self.cv:
+            ok = lambda: (lambda b: b is not None and b[0] <= self.ir_max_dt)(self._ir_match(ts))  # noqa: E731
+            self.cv.wait_for(ok, timeout=max(0.0, deadline - time.time()))
+            best = self._ir_match(ts)
+        if best is None:
+            return None, None, f"{self.ir_wait:.1f}s 內沒有同時間戳的 infra1 / infra2"
+        dt, m1, m2 = best
+        if dt > self.ir_max_dt:
+            return None, None, f"IR 與 color 時間差 {dt * 1e3:.0f} ms > {self.ir_max_dt * 1e3:.0f} ms（等了 {self.ir_wait:.1f}s）"
+        return m1, m2, ""
+
+    def _depth_fn_for(self, color_msg, t_recv=None):
+        """回傳給 NeedlePerception.predict 的 depth_fn。沒開深度（或 camera_info 還沒到）回 None，完全不等。
+        IR 的配對延到 depth_fn 被呼叫時（YOLO／VRB 推論之後）才做：最多等到「收到 color 後 ir_wait 秒」，
+        推論期間 IR 照樣進緩衝區，所以 IR 晚到通常不會多花時間。"""
         if self.depth is None:
             return None
         ts = stamp_sec(color_msg.header.stamp)
-        with self.cv:
-            pairs = {round(s, 4): m for s, m in self.ir[0]}
-            cands = [(abs(s - ts), s, pairs[round(s, 4)], m) for s, m in self.ir[1] if round(s, 4) in pairs]
-        if not cands:
-            self.depth_err = "沒有同時間戳的 infra1 / infra2"
-            return None
-        dt, _, m1, m2 = min(cands, key=lambda x: x[0])
-        if dt > self.ir_max_dt:
-            self.depth_err = f"IR 與 color 時間差 {dt * 1e3:.0f} ms > {self.ir_max_dt * 1e3:.0f} ms"
-            return None
-        left, right = image_to_mono(m1), image_to_mono(m2)
+        deadline = (t_recv if t_recv is not None else time.time()) + self.ir_wait
 
         def fn(uv_list, box, mask):
-            out = self.depth.locate(left, right, uv_color=uv_list, box_color=box, mask_color=mask)
+            m1, m2, err = self._wait_ir(ts, deadline)
+            if m1 is None:
+                self.depth_err = err
+                return [None] * len(uv_list)
+            out = self.depth.locate(image_to_mono(m1), image_to_mono(m2), uv_color=uv_list, box_color=box, mask_color=mask)
             return [o.get("xyz_cam") if o.get("ok", True) else None for o in out]
         return fn
 
@@ -251,7 +302,7 @@ class HandoverPerceptionNode(Node):
             img = image_to_bgr(msg)
             self.depth_err = ""
             res, extra = self.perc.predict(img, stamp=stamp_sec(msg.header.stamp), frame_id=msg.header.frame_id,
-                                           depth_fn=self._depth_fn_for(msg))
+                                           depth_fn=self._depth_fn_for(msg, t_recv))
             if self.depth_err:
                 res["depth_error"] = self.depth_err
         except Exception as e:  # noqa: BLE001
